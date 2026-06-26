@@ -9,8 +9,28 @@ permissions:
   contents: write
 
 jobs:
+  # Create the GitHub Release for the tag up front. The per-target upload jobs
+  # run in parallel and each tried to create the release, racing and failing
+  # with "release not found"; creating it here once (idempotently) gives them a
+  # release to attach assets to.
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
   upload-binaries:
     name: ${{ matrix.target }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,8 +50,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       # Builds `revu` for the target and uploads `revu-<target>.tar.gz` to the
-      # GitHub Release for the pushed tag. Handles cross-compilation (musl,
-      # aarch64) and target installation automatically.
+      # GitHub Release created above. Handles cross-compilation (musl, aarch64)
+      # and target installation automatically.
       #
       # NOTE: no code signing / notarization is wired up (a deliberate, flagged
       # human decision - see the PR). macOS binaries are unsigned.
