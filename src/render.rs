@@ -463,18 +463,20 @@ fn build_cell(
     cell
 }
 
-/// The full-row background tint and the stronger word-emphasis background for a
-/// diff line. Added/removed lines get the theme's add/remove tint plus a vivid
-/// emphasis hue for the changed words; context lines get neither. Moved lines
-/// (git `--color-moved`) are left untinted so their distinct prefix hue keeps
-/// them from reading as a plain add/remove.
+/// The full-row background tint and the word-emphasis background for a diff
+/// line. Added/removed lines get the theme's subtle add/remove row tint plus a
+/// medium emphasis tint (`add_emph_bg`/`remove_emph_bg`) for the changed words —
+/// clearly stronger than the row but well short of the vivid foreground, so
+/// intra-line emphasis reads without a jarring bright box. Context lines get
+/// neither. Moved lines (git `--color-moved`) are left untinted so their distinct
+/// prefix hue keeps them from reading as a plain add/remove.
 fn row_tint(dl: &DiffLine, theme: &Theme) -> (Option<Color>, Option<Color>) {
     if dl.moved {
         return (None, None);
     }
     match dl.kind {
-        LineKind::Add => (Some(theme.add_bg), Some(theme.add)),
-        LineKind::Remove => (Some(theme.remove_bg), Some(theme.remove)),
+        LineKind::Add => (Some(theme.add_bg), Some(theme.add_emph_bg)),
+        LineKind::Remove => (Some(theme.remove_bg), Some(theme.remove_emph_bg)),
         LineKind::Context => (None, None),
     }
 }
@@ -632,9 +634,9 @@ pub fn parse_hunk_new_start(header: &str) -> Option<usize> {
 /// (word-diff ranges and syntect tokens both respect UTF-8), so slicing is safe
 /// and the visible text is byte-for-byte unchanged — emphasis is style-only.
 ///
-/// `emph_bg` is the stronger background painted behind emphasized ranges so the
-/// changed words stay legible against the row tint (`None` keeps the prior
-/// underline-only treatment, e.g. for moved lines).
+/// `emph_bg` is the medium emphasis tint painted behind emphasized ranges so the
+/// changed words read distinctly against the subtle row tint (`None` leaves the
+/// segment un-emphasized, e.g. for moved lines).
 fn push_content_spans(
     spans: &mut Vec<Span<'static>>,
     text: &str,
@@ -674,23 +676,19 @@ fn byte_emphasized(pos: usize, emphasis: &[(usize, usize)]) -> bool {
     emphasis.iter().any(|&(s, e)| pos >= s && pos < e)
 }
 
-/// A content sub-span with the base syntax style; when emphasized it is
-/// underlined and, if `emph_bg` is set, painted on the stronger emphasis
-/// background so the changed words pop against the row tint.
+/// A content sub-span with the base syntax style; when emphasized it is painted
+/// on the medium emphasis tint (`emph_bg`) so the changed words read distinctly
+/// against the subtle row tint. No underline — the tint alone carries emphasis,
+/// avoiding the jarring box-plus-underline double-treatment.
 fn styled_segment(
     text: &str,
     base: Style,
     emphasized: bool,
     emph_bg: Option<Color>,
 ) -> Span<'static> {
-    let style = if emphasized {
-        let s = base.add_modifier(Modifier::UNDERLINED);
-        match emph_bg {
-            Some(bg) => s.bg(bg),
-            None => s,
-        }
-    } else {
-        base
+    let style = match (emphasized, emph_bg) {
+        (true, Some(bg)) => base.bg(bg),
+        _ => base,
     };
     Span::styled(text.to_string(), style)
 }
