@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hard ceiling on the number of transitive crates in the resolved dependency
+  # graph (excluding the root crate). This is the ONE place the budget lives.
+  # Current count at authoring time: 138. See the `crate-budget` job below.
+  CRATE_BUDGET: 155
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (incl. no-network/no-telemetry guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo test` runs tests/supply_chain.rs, which fails if any
+      # network/telemetry crate enters the dependency tree.
+      - run: cargo test --all-targets
+
+  crate-budget:
+    name: transitive-crate budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Count transitive crates and enforce the budget
+        run: |
+          set -euo pipefail
+          count=$(cargo metadata --format-version 1 \
+            | jq '[.resolve.nodes[].id] | length - 1')
+          echo "Transitive crate count: ${count} (budget: ${CRATE_BUDGET})"
+          if [ "${count}" -gt "${CRATE_BUDGET}" ]; then
+            echo "::error::Transitive crate count ${count} exceeds budget ${CRATE_BUDGET}."
+            echo "Trim dependencies or raise CRATE_BUDGET in .github/workflows/ci.yml (a deliberate decision)."
+            exit 1
+          fi
+
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      # Fails on advisories, disallowed licenses, banned/duplicate crates, and
+      # non-crates.io sources, per deny.toml.
+      - name: cargo deny
+        run: cargo deny check
+      # Fails on RustSec vulnerabilities (unmaintained crates are warnings only).
+      - name: cargo audit
+        run: cargo audit
