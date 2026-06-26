@@ -77,8 +77,12 @@ pub struct CustomTheme {
 
 /// One TOML layer, every field optional so "unset" cleanly defers to the layer
 /// below it. Keys are the exact hunk names.
+//
+// Unknown keys are intentionally tolerated (serde's default): a hunk config has
+// keys revu doesn't model (`watch`, `exclude_untracked`, `agent_notes`, ...), and
+// the AC requires such a config to copy over verbatim, so extra keys are ignored
+// rather than rejected.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PartialConfig {
     theme: Option<String>,
     mode: Option<String>,
@@ -86,6 +90,8 @@ struct PartialConfig {
     line_numbers: Option<bool>,
     wrap_lines: Option<bool>,
     hunk_headers: Option<bool>,
+    // hunk also accepts the camelCase spelling.
+    #[serde(alias = "transparentBackground")]
     transparent_background: Option<bool>,
     custom_theme: Option<CustomTheme>,
 }
@@ -317,14 +323,28 @@ keyword = \"#ff00ff\"
     }
 
     #[test]
-    fn unknown_keys_are_rejected() {
-        // deny_unknown_fields guards against silent typos in a hunk config.
-        let err = resolve(
-            Some("line_nubmers = false"),
+    fn unknown_hunk_keys_are_tolerated() {
+        // A hunk config has keys revu doesn't model; it must copy over verbatim.
+        // Unknown keys are ignored, and the keys we DO model still apply.
+        let cfg = resolve(
+            Some(
+                "line_numbers = false\nwatch = true\nexclude_untracked = false\nagent_notes = true\n",
+            ),
             None,
             &ConfigOverrides::default(),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("malformed"));
+        .expect("a verbatim hunk config should load, ignoring unmodeled keys");
+        assert!(!cfg.line_numbers);
+    }
+
+    #[test]
+    fn transparent_background_camelcase_alias() {
+        let cfg = resolve(
+            Some("transparentBackground = true\n"),
+            None,
+            &ConfigOverrides::default(),
+        )
+        .unwrap();
+        assert!(cfg.transparent_background);
     }
 }
