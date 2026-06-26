@@ -114,7 +114,17 @@ impl VcsAdapter for GitAdapter {
         //
         // ponytail: commit metadata (author/message) is not displayed in v1.
         // Surfacing it (e.g. as a synthetic header pane) is a later enhancement.
-        let out = self.run(&["-c", "color.ui=always", "show", "--color-moved=zebra", reff])?;
+        // `--end-of-options` stops a ref that begins with `-` from being parsed
+        // as a flag, while still treating it as a revision (unlike `--`, which
+        // would force pathspec interpretation).
+        let out = self.run(&[
+            "-c",
+            "color.ui=always",
+            "show",
+            "--color-moved=zebra",
+            "--end-of-options",
+            reff,
+        ])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git show failed: {}", stderr.trim()));
@@ -130,6 +140,7 @@ impl VcsAdapter for GitAdapter {
             "show",
             "-p",
             "--color-moved=zebra",
+            "--end-of-options",
             reff,
         ])?;
         if !out.status.success() {
