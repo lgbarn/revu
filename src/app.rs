@@ -54,6 +54,30 @@ pub fn run_diff(
     review_text(&diff_text, &overrides)
 }
 
+/// Review a commit. `reff` defaults to `HEAD`. Reuses the shared [`review_text`]
+/// render path. `overrides` carries CLI display flags (currently always
+/// default for `show`).
+pub fn run_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> {
+    let adapter = GitAdapter::new();
+    // Fail fast (and cleanly) before touching the terminal if not in a repo.
+    adapter.repo_root()?;
+    let reff = reff.unwrap_or_else(|| "HEAD".to_string());
+    let text = adapter.revision_show(&reff)?;
+    review_text(&text, &overrides)
+}
+
+/// Review a stash entry. `reff` defaults to `stash@{0}` (the latest stash).
+/// Reuses the shared [`review_text`] render path. `overrides` carries CLI
+/// display flags (currently always default for `stash show`).
+pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> {
+    let adapter = GitAdapter::new();
+    // Fail fast (and cleanly) before touching the terminal if not in a repo.
+    adapter.repo_root()?;
+    let reff = reff.unwrap_or_else(|| "stash@{0}".to_string());
+    let text = adapter.stash_show(&reff)?;
+    review_text(&text, &overrides)
+}
+
 /// Parse unified diff text and review it interactively. Shared by `diff`,
 /// `pager`, and `patch` so there is a single render-loop path. `overrides`
 /// are the CLI display flags (empty for `pager`/`patch`).

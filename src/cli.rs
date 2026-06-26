@@ -59,6 +59,18 @@ pub enum Command {
         targets: Vec<String>,
     },
 
+    /// Review a commit (defaults to HEAD)
+    Show {
+        /// Commit to review (default HEAD)
+        reff: Option<String>,
+    },
+
+    /// Review stash entries
+    Stash {
+        #[command(subcommand)]
+        cmd: StashCmd,
+    },
+
     /// Render a diff piped on stdin; usable as git's core.pager
     Pager,
 
@@ -66,5 +78,14 @@ pub enum Command {
     Patch {
         /// Patch file to review; `-` or omitted reads from stdin
         file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StashCmd {
+    /// Review a stash entry (default latest)
+    Show {
+        /// Stash entry to review (default stash@{0})
+        reff: Option<String>,
     },
 }
