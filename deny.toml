@@ -19,6 +19,10 @@ ignore = [
     # syntect to load its bundled syntax/theme definitions; no network surface.
     # syntect has not yet migrated off it.
     "RUSTSEC-2024-0320",
+    # bincode 1.x - unmaintained (RUSTSEC-2025-0141). Pulled transitively by
+    # syntect to (de)serialize its bundled syntax/theme dumps at build time; no
+    # runtime or network surface. syntect has not yet migrated to bincode 2.
+    "RUSTSEC-2025-0141",
 ]
 
 [licenses]
