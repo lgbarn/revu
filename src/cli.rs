@@ -71,6 +71,20 @@ pub enum Command {
         cmd: StashCmd,
     },
 
+    /// Diff two files, as invoked by `git difftool`
+    ///
+    /// `git difftool` runs the configured tool with the LOCAL and REMOTE temp
+    /// file paths (and optionally the in-repo path). This renders that file
+    /// pair via `git diff --no-index`, so no repository is required.
+    Difftool {
+        /// Left (LOCAL) file path
+        left: String,
+        /// Right (REMOTE) file path
+        right: String,
+        /// In-repo path git difftool passes (informational in v1)
+        path: Option<String>,
+    },
+
     /// Render a diff piped on stdin; usable as git's core.pager
     Pager,
 
@@ -88,4 +102,34 @@ pub enum StashCmd {
         /// Stash entry to review (default stash@{0})
         reff: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_difftool_with_path() {
+        let cli = Cli::parse_from(["revu", "difftool", "LOCAL", "REMOTE", "src/x.rs"]);
+        match cli.command {
+            Command::Difftool { left, right, path } => {
+                assert_eq!(left, "LOCAL");
+                assert_eq!(right, "REMOTE");
+                assert_eq!(path.as_deref(), Some("src/x.rs"));
+            }
+            _ => panic!("expected Difftool"),
+        }
+    }
+
+    #[test]
+    fn parses_difftool_path_optional() {
+        let cli = Cli::parse_from(["revu", "difftool", "LOCAL", "REMOTE"]);
+        match cli.command {
+            Command::Difftool { left, right, path } => {
+                assert_eq!((left.as_str(), right.as_str()), ("LOCAL", "REMOTE"));
+                assert!(path.is_none());
+            }
+            _ => panic!("expected Difftool"),
+        }
+    }
 }

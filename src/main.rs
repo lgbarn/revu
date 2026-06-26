@@ -52,6 +52,9 @@ fn run() -> anyhow::Result<()> {
         Command::Stash {
             cmd: StashCmd::Show { reff },
         } => app::run_stash_show(reff, ConfigOverrides::default()),
+        Command::Difftool { left, right, path } => {
+            app::run_difftool(left, right, path, ConfigOverrides::default())
+        }
         Command::Pager => pager::run_pager(),
         Command::Patch { file } => pager::run_patch(file),
     }
