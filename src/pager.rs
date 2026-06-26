@@ -26,7 +26,8 @@ pub fn run_pager() -> Result<()> {
     let text = String::from_utf8_lossy(&bytes);
 
     if looks_like_diff(&text) {
-        app::review_text(&text)
+        // pager/patch take no display flags; config + state.json still apply.
+        app::review_text(&text, &crate::config::ConfigOverrides::default())
     } else {
         spawn_text_pager(&bytes)
     }
@@ -45,7 +46,7 @@ pub fn run_patch(file: Option<String>) -> Result<()> {
         PatchSource::File(path) => fs::read_to_string(&path)
             .with_context(|| format!("failed to read patch file `{path}`"))?,
     };
-    app::review_text(&text)
+    app::review_text(&text, &crate::config::ConfigOverrides::default())
 }
 
 /// Decide where `patch` reads from. Pure so it can be tested without touching

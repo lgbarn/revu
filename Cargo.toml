@@ -19,6 +19,14 @@ ratatui = "0.29"
 # while still bundling the default SyntaxSet + ThemeSet. Keeps the core C-free.
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 
+# Config + view-state persistence. All three are pure Rust (no C linkage):
+# - serde (derive): (de)serialize the config layers and the view-state struct.
+# - toml: parse the global/repo-local config.toml layers (hunk-compatible keys).
+# - serde_json: read/write the state.json view-state file.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
 # rustix (pure Rust, no libc) only for dup2'ing /dev/tty onto stdin when a diff
 # is piped in (pager mode). Same 0.38 version crossterm already links, so this
 # enables the `stdio` feature on the existing copy rather than adding a crate.
