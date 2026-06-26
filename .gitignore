@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .revu/
+
+# local secrets (e.g. a PAT saved during tap setup) - never commit
+homebrew-token.gh
+*.token
