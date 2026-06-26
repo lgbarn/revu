@@ -16,7 +16,9 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::highlight::Highlighter;
-use crate::render::{file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions};
+use crate::render::{
+    file_at_offset, file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions,
+};
 use crate::state::ViewState;
 use crate::theme::{self, resolve_theme, Theme};
 use crate::vcs::git::GitAdapter;
@@ -250,9 +252,11 @@ fn run_loop(
     let summaries = file_summaries(model);
     let mut offset: u16 = 0;
     let mut show_help = false;
-    // Sidebar starts visible; selection tracks which file the main view is on.
+    // Sidebar starts visible. The active file is DERIVED from the scroll offset
+    // every frame (see `file_at_offset`), so plain scrolling moves through files
+    // and the sidebar/status follow automatically — there is no separately-held
+    // selection to drift out of sync.
     let mut sidebar_visible = true;
-    let mut selected_file: usize = 0;
     // Render cache: the mode/width the current `lines` were built for, plus a
     // dirty flag set by display toggles. `None` mode forces the first render.
     let mut cur_mode: Option<LayoutMode> = None;
@@ -284,13 +288,16 @@ fn run_loop(
         // Clamp rather than `as u16` so a diff over 65535 lines saturates
         // instead of silently wrapping the scroll bound.
         let total = lines.len().min(u16::MAX as usize) as u16;
+        // Derive the active file from the current scroll offset so the sidebar
+        // highlight and the "file X/Y" status follow scrolling for free.
+        let active_file = file_at_offset(&file_starts, offset as usize);
         let view = ReviewFrame {
             lines: &lines,
             summaries: &summaries,
             opts: &opts,
             theme: &theme,
             file_count,
-            selected_file,
+            selected_file: active_file,
             offset,
             total,
             wrap,
@@ -352,10 +359,11 @@ fn run_loop(
                 KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     suspend_and_resume(terminal);
                 }
-                // Open the currently selected file in $EDITOR. No-op when the
-                // diff has no files.
+                // Open the active file (derived from the scroll offset) in
+                // $EDITOR. No-op when the diff has no files.
                 KeyCode::Char('e') => {
-                    if let Some(summary) = summaries.get(selected_file) {
+                    let active = file_at_offset(&file_starts, offset as usize);
+                    if let Some(summary) = summaries.get(active) {
                         open_in_editor(terminal, &summary.path);
                     }
                 }
@@ -408,16 +416,20 @@ fn run_loop(
                         .unwrap_or(theme_cursor);
                     show_theme_selector = true;
                 }
-                // Sidebar: toggle visibility and navigate between files. Moving
-                // selection jumps the main view to that file's start offset.
+                // Sidebar: toggle visibility and jump between files. Tab/BackTab
+                // are now shortcuts defined in terms of the scroll-derived active
+                // file: jump to the next/previous file's start offset (the active
+                // file then follows the offset like any other scroll).
                 KeyCode::Char('s') => sidebar_visible = !sidebar_visible,
                 KeyCode::Tab | KeyCode::Char(']') if !file_starts.is_empty() => {
-                    selected_file = (selected_file + 1).min(file_starts.len() - 1);
-                    offset = file_to_offset(&file_starts, selected_file, max_offset);
+                    let current = file_at_offset(&file_starts, offset as usize);
+                    let target = (current + 1).min(file_starts.len() - 1);
+                    offset = file_to_offset(&file_starts, target, max_offset);
                 }
                 KeyCode::BackTab | KeyCode::Char('[') if !file_starts.is_empty() => {
-                    selected_file = selected_file.saturating_sub(1);
-                    offset = file_to_offset(&file_starts, selected_file, max_offset);
+                    let current = file_at_offset(&file_starts, offset as usize);
+                    let target = current.saturating_sub(1);
+                    offset = file_to_offset(&file_starts, target, max_offset);
                 }
                 _ => {}
             }
