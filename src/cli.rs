@@ -14,7 +14,19 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Review the working-tree diff
-    Diff,
+    Diff {
+        /// Show only staged changes (alias: --cached)
+        #[arg(long, visible_alias = "cached")]
+        staged: bool,
+
+        /// Omit untracked files from the working-tree review
+        #[arg(long)]
+        exclude_untracked: bool,
+
+        /// Limit the review to matching paths, or diff two files when given
+        /// exactly two existing paths. Arguments after `--` land here too.
+        targets: Vec<String>,
+    },
 
     /// Render a diff piped on stdin; usable as git's core.pager
     Pager,
