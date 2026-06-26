@@ -29,7 +29,8 @@ use crate::vcs::VcsAdapter;
 pub struct Config {
     /// Color theme name. Parsed only; applied in #9. Default "auto".
     pub theme: String,
-    /// Layout mode (auto/split/unified). Parsed only; applied in #6. Default "auto".
+    /// Layout mode (auto/split/unified). Default "stack" — revu opens the
+    /// unified view; "auto" and "split" stay available via `--mode`/the `m` key.
     pub mode: String,
     /// Show a line-number gutter. Default true.
     pub line_numbers: bool,
@@ -50,7 +51,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             theme: "auto".to_string(),
-            mode: "auto".to_string(),
+            mode: "stack".to_string(),
             line_numbers: true,
             wrap_lines: false,
             hunk_headers: true,
@@ -220,11 +221,20 @@ mod tests {
         let cfg = resolve(None, None, &ConfigOverrides::default()).unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.theme, "auto");
-        assert_eq!(cfg.mode, "auto");
+        assert_eq!(cfg.mode, "stack");
         assert!(cfg.line_numbers);
         assert!(!cfg.wrap_lines);
         assert!(cfg.hunk_headers);
         assert!(!cfg.transparent_background);
+    }
+
+    #[test]
+    fn default_mode_is_stack() {
+        // revu defaults to the unified (stack) layout; "auto"/"split" remain
+        // selectable via config or `--mode`.
+        assert_eq!(Config::default().mode, "stack");
+        let cfg = resolve(None, None, &ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.mode, "stack");
     }
 
     #[test]
