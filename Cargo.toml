@@ -23,3 +23,5 @@ rustix = { version = "0.38", features = ["stdio"] }
 [dev-dependencies]
 # insta: snapshot testing of rendered terminal buffers.
 insta = "1"
+# tempfile: scratch git repos / files for VcsAdapter unit tests (dev only).
+tempfile = "3"

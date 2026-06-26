@@ -14,14 +14,31 @@ use ratatui::DefaultTerminal;
 use crate::diff::parse_unified_diff;
 use crate::render::render_lines;
 use crate::vcs::git::GitAdapter;
-use crate::vcs::VcsAdapter;
+use crate::vcs::{DiffOptions, VcsAdapter};
 
-/// Load the working-tree diff and review it interactively.
-pub fn run_diff() -> Result<()> {
+/// Load the selected diff and review it interactively.
+///
+/// `revu diff <fileA> <fileB>` (two existing paths) diffs those files directly
+/// and does not require a repository. Otherwise `targets` are treated as a path
+/// filter on the working-tree (or staged) diff.
+pub fn run_diff(staged: bool, exclude_untracked: bool, targets: Vec<String>) -> Result<()> {
     let adapter = GitAdapter::new();
-    // Fail fast (and cleanly) before touching the terminal if we're not in a repo.
-    adapter.repo_root()?;
-    let diff_text = adapter.working_tree_diff()?;
+
+    let diff_text = if targets.len() == 2
+        && std::path::Path::new(&targets[0]).exists()
+        && std::path::Path::new(&targets[1]).exists()
+    {
+        // Two-file mode: arbitrary file comparison, no repo required.
+        adapter.diff_files(&targets[0], &targets[1])?
+    } else {
+        // Fail fast (and cleanly) before touching the terminal if not in a repo.
+        adapter.repo_root()?;
+        adapter.diff(&DiffOptions {
+            staged,
+            paths: targets,
+            include_untracked: !exclude_untracked,
+        })?
+    };
     review_text(&diff_text)
 }
 
