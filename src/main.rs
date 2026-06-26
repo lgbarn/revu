@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod diff;
+mod fold;
 mod highlight;
 mod pager;
 mod render;
