@@ -44,6 +44,11 @@ pub struct Theme {
     pub add: Color,
     /// Removed (`-`) line prefix.
     pub remove: Color,
+    /// Full-row background tint behind added (`+`) lines. A low-luminance hue so
+    /// the syntax-highlighted foreground stays readable on top.
+    pub add_bg: Color,
+    /// Full-row background tint behind removed (`-`) lines. Companion to `add_bg`.
+    pub remove_bg: Color,
     /// Context (` `) line prefix.
     pub context: Color,
     /// Line-number gutter, the binary-file note, and the split separator.
@@ -88,6 +93,8 @@ fn mk(
     hunk_header: u32,
     add: u32,
     remove: u32,
+    add_bg: u32,
+    remove_bg: u32,
     context: u32,
     gutter: u32,
     moved_add: u32,
@@ -103,6 +110,8 @@ fn mk(
         hunk_header: rgb(hunk_header),
         add: rgb(add),
         remove: rgb(remove),
+        add_bg: rgb(add_bg),
+        remove_bg: rgb(remove_bg),
         context: rgb(context),
         gutter: rgb(gutter),
         moved_add: rgb(moved_add),
@@ -121,7 +130,7 @@ fn mk(
 /// the tests so a typo can't panic at runtime).
 pub fn catalog() -> Vec<Theme> {
     vec![
-        // name, dark, syntect, header, hunk, add, remove, context, gutter, moved+, moved-, selection, status_fg, status_bg
+        // name, dark, syntect, header, hunk, add, remove, add_bg, remove_bg, context, gutter, moved+, moved-, selection, status_fg, status_bg
         mk(
             "github-light",
             false,
@@ -130,6 +139,8 @@ pub fn catalog() -> Vec<Theme> {
             0x6639ba,
             0x1a7f37,
             0xcf222e,
+            0xe6ffed,
+            0xffeef0,
             0x57606a,
             0x8c959f,
             0x0969da,
@@ -146,6 +157,8 @@ pub fn catalog() -> Vec<Theme> {
             0xbc8cff,
             0x3fb950,
             0xf85149,
+            0x12261c,
+            0x2d1517,
             0x8b949e,
             0x484f58,
             0x58a6ff,
@@ -162,6 +175,8 @@ pub fn catalog() -> Vec<Theme> {
             0xcba6f7,
             0xa6e3a1,
             0xf38ba8,
+            0x1f3328,
+            0x35202b,
             0xa6adc8,
             0x585b70,
             0x89dceb,
@@ -178,6 +193,8 @@ pub fn catalog() -> Vec<Theme> {
             0xff79c6,
             0x50fa7b,
             0xff5555,
+            0x1d3327,
+            0x3a2128,
             0x6272a4,
             0x44475a,
             0x8be9fd,
@@ -194,6 +211,8 @@ pub fn catalog() -> Vec<Theme> {
             0xb48ead,
             0xa3be8c,
             0xbf616a,
+            0x20342a,
+            0x382229,
             0xd8dee9,
             0x4c566a,
             0x8fbcbb,
@@ -210,6 +229,8 @@ pub fn catalog() -> Vec<Theme> {
             0xbb9af7,
             0x9ece6a,
             0xf7768e,
+            0x1b3328,
+            0x33202a,
             0xa9b1d6,
             0x414868,
             0x7dcfff,
@@ -226,6 +247,8 @@ pub fn catalog() -> Vec<Theme> {
             0xd3869b,
             0xb8bb26,
             0xfb4934,
+            0x2a3320,
+            0x3a221c,
             0xa89984,
             0x504945,
             0x83a598,
@@ -242,6 +265,8 @@ pub fn catalog() -> Vec<Theme> {
             0x8f3f71,
             0x79740e,
             0x9d0006,
+            0xe4ecca,
+            0xf6ddc9,
             0x7c6f64,
             0xbdae93,
             0x076678,
@@ -258,6 +283,8 @@ pub fn catalog() -> Vec<Theme> {
             0x6c71c4,
             0x859900,
             0xdc322f,
+            0x123a2c,
+            0x3a2024,
             0x93a1a1,
             0x586e75,
             0x2aa198,
@@ -274,6 +301,8 @@ pub fn catalog() -> Vec<Theme> {
             0x6c71c4,
             0x859900,
             0xdc322f,
+            0xe6ecc8,
+            0xf6ddcc,
             0x657b83,
             0x93a1a1,
             0x2aa198,
@@ -290,6 +319,8 @@ pub fn catalog() -> Vec<Theme> {
             0xae81ff,
             0xa6e22e,
             0xf92672,
+            0x26331d,
+            0x3a1f2a,
             0x75715e,
             0x49483e,
             0x66d9ef,
@@ -306,6 +337,8 @@ pub fn catalog() -> Vec<Theme> {
             0xc678dd,
             0x98c379,
             0xe06c75,
+            0x1d3326,
+            0x33202a,
             0xabb2bf,
             0x5c6370,
             0x56b6c2,
@@ -381,6 +414,8 @@ fn apply_ui_overrides(theme: &mut Theme, colors: &BTreeMap<String, String>) -> R
         match key.as_str() {
             "added" | "add" => theme.add = color,
             "removed" | "remove" => theme.remove = color,
+            "added_bg" | "add_bg" => theme.add_bg = color,
+            "removed_bg" | "remove_bg" => theme.remove_bg = color,
             "context" => theme.context = color,
             "file_header" | "header" => theme.file_header = color,
             "hunk_header" | "hunk" => theme.hunk_header = color,
@@ -486,6 +521,13 @@ mod tests {
                 t.name,
                 t.syntect_theme
             );
+            // Every theme defines distinct add/remove row tints so the two
+            // change kinds are never confusable by background alone.
+            assert_ne!(
+                t.add_bg, t.remove_bg,
+                "theme {:?} has identical add_bg/remove_bg tints",
+                t.name
+            );
         }
     }
 
@@ -544,6 +586,52 @@ mod tests {
         assert_ne!(resolved.add, base.add);
         // ...while an untouched field still matches the base theme.
         assert_eq!(resolved.remove, base.remove);
+    }
+
+    #[test]
+    fn custom_theme_overrides_row_tints() {
+        let base = resolve_theme(&cfg_with_theme("nord"), true).unwrap();
+
+        let mut colors = BTreeMap::new();
+        colors.insert("add_bg".to_string(), "#102010".to_string());
+        colors.insert("remove_bg".to_string(), "#201010".to_string());
+        let cfg = Config {
+            theme: "nord".to_string(),
+            custom_theme: Some(CustomTheme {
+                base: None,
+                label: None,
+                syntax: None,
+                colors,
+            }),
+            ..Config::default()
+        };
+
+        let resolved = resolve_theme(&cfg, true).unwrap();
+        assert_eq!(resolved.add_bg, Color::Rgb(0x10, 0x20, 0x10));
+        assert_eq!(resolved.remove_bg, Color::Rgb(0x20, 0x10, 0x10));
+        assert_ne!(resolved.add_bg, base.add_bg);
+        assert_ne!(resolved.remove_bg, base.remove_bg);
+    }
+
+    #[test]
+    fn custom_theme_invalid_row_tint_hex_is_rejected() {
+        let mut colors = BTreeMap::new();
+        colors.insert("add_bg".to_string(), "#12345".to_string()); // 5 digits
+        let cfg = Config {
+            theme: "nord".to_string(),
+            custom_theme: Some(CustomTheme {
+                base: None,
+                label: None,
+                syntax: None,
+                colors,
+            }),
+            ..Config::default()
+        };
+        let err = resolve_theme(&cfg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid hex color"),
+            "expected a clear invalid-hex error, got: {err}"
+        );
     }
 
     #[test]
