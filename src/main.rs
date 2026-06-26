@@ -7,6 +7,7 @@ mod pager;
 mod render;
 mod state;
 mod vcs;
+mod worddiff;
 
 use clap::Parser;
 

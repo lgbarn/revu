@@ -14,6 +14,15 @@ pub enum LineKind {
 pub struct DiffLine {
     pub kind: LineKind,
     pub content: String,
+    /// Byte ranges into `content` that changed relative to the paired line, for
+    /// intra-line word-level emphasis. Empty unless filled by
+    /// [`crate::worddiff::compute_word_emphasis`]. Carried on the model so a
+    /// future split layout can emphasize the same segments.
+    pub emphasis: Vec<(usize, usize)>,
+    /// Whether git's `--color-moved` classified this added/removed line as part
+    /// of a moved block (vs a genuine add/remove). Set only by
+    /// [`parse_unified_diff_colored`]; always `false` from the plain parser.
+    pub moved: bool,
 }
 
 /// A single `@@ ... @@` hunk and its lines.
@@ -41,12 +50,39 @@ pub struct DiffModel {
 ///
 /// Header lines that precede the first `@@` (`index`, `--- a/...`, `+++ b/...`,
 /// `new file mode`, etc.) are consumed for the file path and otherwise ignored.
+// The live paths all go through `parse_unified_diff_colored` (ANSI-safe on
+// plain input too), leaving this plain parser used only by tests in this binary
+// crate as the reference for plain-input behavior — hence the `allow`.
+#[allow(dead_code)]
 pub fn parse_unified_diff(text: &str) -> DiffModel {
+    // Plain input carries no move information, so every line is `moved = false`.
+    build_model(text.lines().map(|line| (line.to_string(), false)))
+}
+
+/// Like [`parse_unified_diff`], but ANSI-aware: it strips SGR escape sequences
+/// from each line to recover clean content/kind, AND inspects the SGR colors to
+/// detect git's `--color-moved` classification, setting [`DiffLine::moved`].
+///
+/// On plain (zero-ANSI) input this behaves exactly like [`parse_unified_diff`]
+/// (all `moved = false`), so it is safe to route arbitrary pager/patch stdin
+/// through it. See [`codes_indicate_move`] for the move-color heuristic.
+pub fn parse_unified_diff_colored(text: &str) -> DiffModel {
+    build_model(text.lines().map(|raw| {
+        let (clean, codes) = strip_sgr(raw);
+        (clean, codes_indicate_move(&codes))
+    }))
+}
+
+/// Shared parser core. Each input item is a `(clean_line, moved)` pair: the
+/// line with any ANSI already stripped, and whether its color marked it moved.
+/// `moved` is only honored on added/removed lines (context/headers are never
+/// moved). Keeping one core means the plain and colored parsers cannot drift.
+fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut cur_file: Option<FileDiff> = None;
     let mut cur_hunk: Option<Hunk> = None;
 
-    for line in text.lines() {
+    for (line, moved) in lines {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             flush_hunk(&mut cur_file, &mut cur_hunk);
             if let Some(f) = cur_file.take() {
@@ -64,7 +100,7 @@ pub fn parse_unified_diff(text: &str) -> DiffModel {
         } else if line.starts_with("@@") {
             flush_hunk(&mut cur_file, &mut cur_hunk);
             cur_hunk = Some(Hunk {
-                header: line.to_string(),
+                header: line.clone(),
                 lines: Vec::new(),
             });
         } else if let Some(hunk) = cur_hunk.as_mut() {
@@ -76,9 +112,15 @@ pub fn parse_unified_diff(text: &str) -> DiffModel {
                 Some('-') => (LineKind::Remove, line[1..].to_string()),
                 Some(' ') => (LineKind::Context, line[1..].to_string()),
                 // e.g. "\ No newline at end of file" — keep as context.
-                _ => (LineKind::Context, line.to_string()),
+                _ => (LineKind::Context, line.clone()),
             };
-            hunk.lines.push(DiffLine { kind, content });
+            let moved = moved && matches!(kind, LineKind::Add | LineKind::Remove);
+            hunk.lines.push(DiffLine {
+                kind,
+                content,
+                emphasis: Vec::new(),
+                moved,
+            });
         }
     }
 
@@ -87,6 +129,65 @@ pub fn parse_unified_diff(text: &str) -> DiffModel {
         files.push(f);
     }
     DiffModel { files }
+}
+
+/// Strip ANSI SGR (`ESC [ ... m`) escape sequences from `line`, returning the
+/// clean text and the numeric SGR parameters encountered (e.g. `[1, 36]` for
+/// bold cyan). Non-SGR CSI sequences and lone escapes are dropped without
+/// contributing codes. A small hand-rolled scanner — no regex crate needed.
+///
+/// ponytail: only CSI (`ESC [`) sequences are handled; other escape forms
+/// (OSC, etc.) do not appear in `git diff` color output, so they are out of
+/// scope. Final bytes other than `m` are treated as non-SGR and ignored.
+fn strip_sgr(line: &str) -> (String, Vec<u16>) {
+    let mut clean = String::with_capacity(line.len());
+    let mut codes: Vec<u16> = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            clean.push(c);
+            continue;
+        }
+        // ESC: only a following `[` (CSI) is a recognized sequence.
+        if chars.peek() != Some(&'[') {
+            continue;
+        }
+        chars.next(); // consume '['
+        let mut params = String::new();
+        let mut final_byte = None;
+        // CSI parameter/intermediate bytes run until a final byte (an ASCII
+        // letter here covers `m` and the cursor-movement finals we discard).
+        while let Some(&nc) = chars.peek() {
+            chars.next();
+            if nc.is_ascii_alphabetic() {
+                final_byte = Some(nc);
+                break;
+            }
+            params.push(nc);
+        }
+        if final_byte == Some('m') {
+            for p in params.split(';') {
+                if let Ok(n) = p.parse::<u16>() {
+                    codes.push(n);
+                }
+            }
+        }
+    }
+    (clean, codes)
+}
+
+/// Decide whether an added/removed line's SGR colors mark it as part of a git
+/// `--color-moved` block. Normal changed lines are colored green (32) / red
+/// (31); git's move palette uses other hues — magenta/cyan for the main moved
+/// blocks and blue/yellow for the zebra alternates (plus their bright 9x
+/// variants). So a foreground among {33,34,35,36,93,94,95,96} flags a move.
+///
+/// Heuristic and git-version dependent (git owns the move classification; revu
+/// only reads the resulting color). Documented + isolated here on purpose.
+fn codes_indicate_move(codes: &[u16]) -> bool {
+    codes
+        .iter()
+        .any(|&c| matches!(c, 33 | 34 | 35 | 36 | 93 | 94 | 95 | 96))
 }
 
 fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>) {
@@ -185,5 +286,75 @@ diff --git a/x b/x
 ";
         let model = parse_unified_diff(text);
         assert_eq!(model.files[0].hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn strip_sgr_removes_escapes_and_collects_codes() {
+        let (clean, codes) = strip_sgr("\x1b[1;36m+moved\x1b[m");
+        assert_eq!(clean, "+moved");
+        assert_eq!(codes, vec![1, 36]);
+        // Plain text yields itself and no codes.
+        let (clean, codes) = strip_sgr("+normal");
+        assert_eq!(clean, "+normal");
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn colored_parser_on_plain_input_matches_plain_parser() {
+        // The colored parser must be a drop-in for plain (zero-ANSI) text: same
+        // content, kinds, and all `moved = false`.
+        let plain = parse_unified_diff(SAMPLE_PLAIN);
+        let colored = parse_unified_diff_colored(SAMPLE_PLAIN);
+        assert_eq!(plain, colored);
+        for file in &colored.files {
+            for hunk in &file.hunks {
+                for dl in &hunk.lines {
+                    assert!(!dl.moved, "plain input must never be moved: {dl:?}");
+                }
+            }
+        }
+    }
+
+    const SAMPLE_PLAIN: &str = "\
+diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+";
+
+    #[test]
+    fn colored_parser_detects_moved_lines() {
+        // Hand-crafted colored diff: a normal change (green/red) plus a moved
+        // block (cyan new-moved / magenta old-moved, git's zebra palette).
+        let colored = concat!(
+            "\x1b[1mdiff --git a/a.txt b/a.txt\x1b[m\n",
+            "\x1b[36m@@ -1,4 +1,4 @@\x1b[m\n",
+            "\x1b[32m+added normally\x1b[m\n",
+            "\x1b[31m-removed normally\x1b[m\n",
+            "\x1b[1;36m+moved in here\x1b[m\n",
+            "\x1b[1;35m-moved out there\x1b[m\n",
+        );
+        let model = parse_unified_diff_colored(colored);
+        let lines = &model.files[0].hunks[0].lines;
+        assert_eq!(lines.len(), 4);
+
+        assert_eq!(lines[0].kind, LineKind::Add);
+        assert_eq!(lines[0].content, "added normally");
+        assert!(!lines[0].moved, "green add must not be moved");
+
+        assert_eq!(lines[1].kind, LineKind::Remove);
+        assert!(!lines[1].moved, "red remove must not be moved");
+
+        assert_eq!(lines[2].kind, LineKind::Add);
+        assert_eq!(lines[2].content, "moved in here");
+        assert!(lines[2].moved, "cyan add must be moved");
+
+        assert_eq!(lines[3].kind, LineKind::Remove);
+        assert_eq!(lines[3].content, "moved out there");
+        assert!(lines[3].moved, "magenta remove must be moved");
     }
 }
