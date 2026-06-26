@@ -1,0 +1,56 @@
+# cargo-deny configuration for revu.
+#
+# Tuned to the ACTUAL resolved dependency tree (see the PR body for the full
+# license inventory and crate scan). cargo-deny is NOT run locally during
+# development; CI installs it on the runner and runs `cargo deny check`, so this
+# file is written for the current (v2-schema) cargo-deny.
+
+[advisories]
+version = 2
+# The RustSec advisory DB. Vulnerabilities are always denied (hard error), and
+# unmaintained advisories are denied by default. `ignore` lists the advisories
+# we have consciously accepted, each with a justification.
+ignore = [
+    # paste 1.0.15 - unmaintained (RUSTSEC-2024-0436). Pulled transitively by
+    # ratatui; it is a build-time proc-macro only, with no runtime or network
+    # surface. No maintained drop-in replacement exists yet.
+    "RUSTSEC-2024-0436",
+    # yaml-rust 0.4.5 - unmaintained (RUSTSEC-2024-0320). Pulled transitively by
+    # syntect to load its bundled syntax/theme definitions; no network surface.
+    # syntect has not yet migrated off it.
+    "RUSTSEC-2024-0320",
+]
+
+[licenses]
+version = 2
+# SPDX licenses actually present in our tree. Every dependency's license
+# expression is satisfied by exactly this set (permissive-only):
+#   MIT          - the bulk of the tree
+#   Apache-2.0   - dual-licensed crates and a few Apache-only crates
+#   Unicode-3.0  - required by unicode-ident ("(MIT OR Apache-2.0) AND Unicode-3.0")
+#   Zlib         - foldhash
+# OR-expressions that mention other licenses (0BSD, BSL-1.0, Unlicense,
+# LGPL-2.1-or-later, Apache-2.0 WITH LLVM-exception) are all satisfied via their
+# MIT/Apache-2.0 alternative, so those extra licenses are intentionally NOT
+# allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# rustix resolves to two semver-incompatible versions in our tree (0.38.x via
+# crossterm's stack and 1.x). This is a known, acceptable duplicate during the
+# ecosystem's rustix 0.38 -> 1.0 migration, so we WARN on duplicate versions
+# rather than failing CI. Revisit once crossterm bumps to rustix 1.x.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Only the public crates.io registry is permitted as a package source.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
