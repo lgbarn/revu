@@ -1,5 +1,8 @@
-//! Terminal setup and the interactive event loop for `revu diff`.
+//! Terminal setup and the interactive review loop shared by `diff`, `pager`,
+//! and `patch` (via [`review_text`]).
 
+#[cfg(unix)]
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -19,8 +22,22 @@ pub fn run_diff() -> Result<()> {
     // Fail fast (and cleanly) before touching the terminal if we're not in a repo.
     adapter.repo_root()?;
     let diff_text = adapter.working_tree_diff()?;
-    let model = parse_unified_diff(&diff_text);
+    review_text(&diff_text)
+}
+
+/// Parse unified diff text and review it interactively. Shared by `diff`,
+/// `pager`, and `patch` so there is a single render-loop path.
+pub fn review_text(diff_text: &str) -> Result<()> {
+    let model = parse_unified_diff(diff_text);
     let lines = render_lines(&model);
+
+    // When the diff arrives on a pipe (e.g. git's pager), stdin is not the
+    // terminal, so crossterm has nothing to read key events from. Reopen the
+    // controlling tty onto fd 0 before initializing the UI.
+    #[cfg(unix)]
+    if !std::io::stdin().is_terminal() {
+        reopen_controlling_tty()?;
+    }
 
     // `ratatui::init` installs a panic hook that restores the terminal, so a
     // crash mid-render won't leave the user in a broken alternate screen.
@@ -28,6 +45,24 @@ pub fn run_diff() -> Result<()> {
     let result = run_loop(&mut terminal, &lines);
     ratatui::restore();
     result
+}
+
+/// Redirect `/dev/tty` onto stdin (fd 0) so the interactive loop can read key
+/// events even when the diff was piped in. Uses rustix (no libc).
+#[cfg(unix)]
+fn reopen_controlling_tty() -> Result<()> {
+    use anyhow::Context;
+    use std::fs::OpenOptions;
+
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("failed to open /dev/tty for interactive input")?;
+    // dup2 makes fd 0 an independent handle on the tty; dropping `tty`
+    // afterwards closes only the extra fd, leaving fd 0 valid.
+    rustix::stdio::dup2_stdin(&tty).context("failed to redirect /dev/tty onto stdin")?;
+    Ok(())
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, lines: &[Line<'static>]) -> Result<()> {

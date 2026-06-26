@@ -14,6 +14,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 
+# rustix (pure Rust, no libc) only for dup2'ing /dev/tty onto stdin when a diff
+# is piped in (pager mode). Same 0.38 version crossterm already links, so this
+# enables the `stdio` feature on the existing copy rather than adding a crate.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["stdio"] }
+
 [dev-dependencies]
 # insta: snapshot testing of rendered terminal buffers.
 insta = "1"

@@ -507,6 +507,7 @@ dependencies = [
  "clap",
  "insta",
  "ratatui",
+ "rustix 0.38.44",
 ]
 
 [[package]]
