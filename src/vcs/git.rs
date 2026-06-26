@@ -76,6 +76,10 @@ impl VcsAdapter for GitAdapter {
             "color.ui=always".into(),
             "diff".into(),
             "--color-moved=zebra".into(),
+            // Load the WHOLE file as context (not git's default 3 lines) so the
+            // model holds every line; the renderer folds long unchanged runs into
+            // collapsible bars, keeping the visible render small (see src/fold.rs).
+            "--unified=100000".into(),
         ];
         if opts.staged {
             args.push("--staged".into());
@@ -122,6 +126,8 @@ impl VcsAdapter for GitAdapter {
             "color.ui=always",
             "show",
             "--color-moved=zebra",
+            // Full-file context (see `diff`): fold long unchanged runs at render.
+            "--unified=100000",
             "--end-of-options",
             reff,
         ])?;
@@ -140,6 +146,8 @@ impl VcsAdapter for GitAdapter {
             "show",
             "-p",
             "--color-moved=zebra",
+            // Full-file context (see `diff`): fold long unchanged runs at render.
+            "--unified=100000",
             "--end-of-options",
             reff,
         ])?;
@@ -187,6 +195,8 @@ impl GitAdapter {
             "color.ui=never",
             "diff",
             "--no-index",
+            // Full-file context (see `diff`): fold long unchanged runs at render.
+            "--unified=100000",
             "--",
             left,
             right,
