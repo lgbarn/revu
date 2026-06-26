@@ -7,9 +7,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::diff::{DiffModel, LineKind};
+use crate::highlight::Highlighter;
 
 /// Render the model as a flat list of styled lines (unified/stack layout).
-pub fn render_lines(model: &DiffModel) -> Vec<Line<'static>> {
+///
+/// `highlighter` provides syntax coloring for the diff content. The leading
+/// `+`/`-`/space prefix keeps its add/remove color (the change signal), while
+/// the content after it is colored by language token.
+pub fn render_lines(model: &DiffModel, highlighter: &Highlighter) -> Vec<Line<'static>> {
     if model.files.is_empty() {
         return vec![Line::from("No changes in the working tree.")];
     }
@@ -30,22 +35,35 @@ pub fn render_lines(model: &DiffModel) -> Vec<Line<'static>> {
             )));
         }
 
+        // Resolve the file's syntax once; unknown extensions fall back to plain
+        // text inside `syntax_for_path`.
+        let syntax = highlighter.syntax_for_path(&file.path);
+
         for hunk in &file.hunks {
             out.push(Line::from(Span::styled(
                 hunk.header.clone(),
                 Style::default().fg(Color::Cyan),
             )));
 
+            // ponytail: a fresh HighlightLines per hunk means highlight state
+            // (open strings/comments spanning hunk boundaries) resets at each
+            // `@@`. Acceptable for diff review — hunks are non-contiguous slices
+            // of the file anyway. Whole-file state would need the full source.
+            let mut hl = highlighter.line_highlighter(syntax);
+
             for dl in &hunk.lines {
-                let (prefix, style) = match dl.kind {
+                let (prefix, prefix_style) = match dl.kind {
                     LineKind::Add => ('+', Style::default().fg(Color::Green)),
                     LineKind::Remove => ('-', Style::default().fg(Color::Red)),
                     LineKind::Context => (' ', Style::default().fg(Color::Gray)),
                 };
-                out.push(Line::from(Span::styled(
-                    format!("{prefix}{}", dl.content),
-                    style,
-                )));
+
+                let mut spans: Vec<Span<'static>> =
+                    vec![Span::styled(prefix.to_string(), prefix_style)];
+                for (color, text) in highlighter.highlight_line(&mut hl, &dl.content) {
+                    spans.push(Span::styled(text, Style::default().fg(color)));
+                }
+                out.push(Line::from(spans));
             }
         }
 
@@ -78,7 +96,8 @@ index e69de29..4b825dc 100644
     #[test]
     fn renders_diff_to_buffer() {
         let model = parse_unified_diff(SAMPLE);
-        let lines = render_lines(&model);
+        let highlighter = Highlighter::new();
+        let lines = render_lines(&model, &highlighter);
 
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -91,7 +110,8 @@ index e69de29..4b825dc 100644
 
     #[test]
     fn empty_model_shows_placeholder() {
-        let lines = render_lines(&DiffModel::default());
+        let highlighter = Highlighter::new();
+        let lines = render_lines(&DiffModel::default(), &highlighter);
         assert_eq!(lines.len(), 1);
     }
 }

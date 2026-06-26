@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::DefaultTerminal;
 
 use crate::diff::parse_unified_diff;
+use crate::highlight::Highlighter;
 use crate::render::render_lines;
 use crate::vcs::git::GitAdapter;
 use crate::vcs::{DiffOptions, VcsAdapter};
@@ -46,7 +47,10 @@ pub fn run_diff(staged: bool, exclude_untracked: bool, targets: Vec<String>) -> 
 /// `pager`, and `patch` so there is a single render-loop path.
 pub fn review_text(diff_text: &str) -> Result<()> {
     let model = parse_unified_diff(diff_text);
-    let lines = render_lines(&model);
+    // One highlighter for the whole review: building the syntax/theme sets is
+    // expensive, so it is created once here (the shared render path).
+    let highlighter = Highlighter::new();
+    let lines = render_lines(&model, &highlighter);
 
     // When the diff arrives on a pipe (e.g. git's pager), stdin is not the
     // terminal, so crossterm has nothing to read key events from. Reopen the
