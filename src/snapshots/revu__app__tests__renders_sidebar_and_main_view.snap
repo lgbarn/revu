@@ -1,0 +1,20 @@
+---
+source: src/app.rs
+expression: terminal.backend()
+---
+"┌ files ───────────────────┐── src/main.rs                                      "
+"│src/lib.rs           +2 -1│@@ -1 +1,2 @@                                       "
+"│src/main.rs          +1 -0│   1  fn main() {}                                  "
+"│README.md            +1 -2│   2 +// note                                       "
+"│                          │                                                    "
+"│                          │── README.md                                        "
+"│                          │@@ -1,2 +1,1 @@                                     "
+"│                          │     -old title                                     "
+"│                          │     -old body                                      "
+"│                          │   1 +new title                                     "
+"│                          │                                                    "
+"│                          │                                                    "
+"│                          │                                                    "
+"│                          │                                                    "
+"└──────────────────────────┘                                                    "
+" file 2/3  100%  [LN HDR]  s sidebar  ? help                                    "
