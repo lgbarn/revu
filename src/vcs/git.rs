@@ -66,9 +66,17 @@ impl VcsAdapter for GitAdapter {
     }
 
     fn diff(&self, opts: &DiffOptions) -> Result<String> {
-        // `-c color.ui=never` forces plain output regardless of the user's git
-        // config, so our own parser/renderer sees clean diff text.
-        let mut args: Vec<String> = vec!["-c".into(), "color.ui=never".into(), "diff".into()];
+        // `-c color.ui=always` forces colored output regardless of the user's
+        // git config, and `--color-moved=zebra` annotates moved blocks with the
+        // move palette. The ANSI-aware parser (`parse_unified_diff_colored`)
+        // recovers clean text and reads the move colors. Untracked files are
+        // synthesized plain below (no move detection there — acceptable).
+        let mut args: Vec<String> = vec![
+            "-c".into(),
+            "color.ui=always".into(),
+            "diff".into(),
+            "--color-moved=zebra".into(),
+        ];
         if opts.staged {
             args.push("--staged".into());
         }
@@ -290,6 +298,59 @@ mod tests {
         assert!(
             !out.contains("untracked.txt"),
             "pathspec did not scope: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_colored_marks_moved_block_via_real_git() {
+        use crate::diff::parse_unified_diff_colored;
+
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+
+        // A header, an 8-line distinctive block, then a footer. Relocating the
+        // footer above the block is a move git's `--color-moved=zebra` flags.
+        let mut original = String::from("header line one\nheader line two\n");
+        for i in 1..=8 {
+            original.push_str(&format!("the moved content number {i} here\n"));
+        }
+        original.push_str("footer line one\nfooter line two\n");
+        fs::write(p.join("f.txt"), &original).unwrap();
+        git(p, &["add", "f.txt"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+
+        let mut moved = String::from("header line one\nheader line two\n");
+        moved.push_str("footer line one\nfooter line two\n");
+        for i in 1..=8 {
+            moved.push_str(&format!("the moved content number {i} here\n"));
+        }
+        fs::write(p.join("f.txt"), &moved).unwrap();
+
+        let adapter = GitAdapter::in_dir(p);
+        let text = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec![],
+                include_untracked: false,
+            })
+            .unwrap();
+        let model = parse_unified_diff_colored(&text);
+
+        // At least one added/removed line is flagged as moved, and the genuine
+        // (non-moved) context lines are not.
+        let moved_count = model
+            .files
+            .iter()
+            .flat_map(|f| f.hunks.iter())
+            .flat_map(|h| h.lines.iter())
+            .filter(|dl| dl.moved)
+            .count();
+        assert!(
+            moved_count > 0,
+            "expected git --color-moved to flag a moved line; diff was:\n{text}"
         );
     }
 

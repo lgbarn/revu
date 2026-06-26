@@ -14,12 +14,13 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{Config, ConfigOverrides};
-use crate::diff::{parse_unified_diff, DiffModel};
+use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::highlight::Highlighter;
 use crate::render::{file_summaries, render_diff, FileSummary, RenderOptions};
 use crate::state::ViewState;
 use crate::vcs::git::GitAdapter;
 use crate::vcs::{DiffOptions, VcsAdapter};
+use crate::worddiff::compute_word_emphasis;
 
 /// Load the selected diff and review it interactively.
 ///
@@ -57,7 +58,12 @@ pub fn run_diff(
 /// `pager`, and `patch` so there is a single render-loop path. `overrides`
 /// are the CLI display flags (empty for `pager`/`patch`).
 pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
-    let model = parse_unified_diff(diff_text);
+    // The colored parser is ANSI-aware (for git's `--color-moved` output) but
+    // behaves identically to the plain parser on zero-ANSI input, so it safely
+    // handles arbitrary pager/patch stdin too.
+    let mut model = parse_unified_diff_colored(diff_text);
+    // Fill intra-line word-level emphasis on modified lines before rendering.
+    compute_word_emphasis(&mut model);
     // One highlighter for the whole review: building the syntax/theme sets is
     // expensive, so it is created once here (the shared render path).
     let highlighter = Highlighter::new();
@@ -515,7 +521,7 @@ index 5555555..6666666 100644
 
     #[test]
     fn renders_sidebar_and_main_view() {
-        let model = parse_unified_diff(MULTI_FILE);
+        let model = parse_unified_diff_colored(MULTI_FILE);
         let highlighter = Highlighter::new();
         let opts = RenderOptions::default();
         let rendered = render_diff(&model, &highlighter, &opts);
