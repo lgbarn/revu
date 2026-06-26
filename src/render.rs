@@ -160,11 +160,21 @@ pub fn render_diff(
             for dl in &hunk.lines {
                 // Add/Context advance the new-side counter; Remove does not (it
                 // only exists on the old side), so it gets a blank gutter.
-                let (prefix, prefix_style, on_new_side) = match dl.kind {
+                let (prefix, mut prefix_style, on_new_side) = match dl.kind {
                     LineKind::Add => ('+', Style::default().fg(Color::Green), true),
                     LineKind::Remove => ('-', Style::default().fg(Color::Red), false),
                     LineKind::Context => (' ', Style::default().fg(Color::Gray), true),
                 };
+                // Moved lines (git `--color-moved`) get the zebra hues — cyan
+                // for the moved-in (+) side, magenta for the moved-out (-) side
+                // — so they read as relocations, not genuine add/removes.
+                if dl.moved {
+                    prefix_style = match dl.kind {
+                        LineKind::Add => Style::default().fg(Color::Cyan),
+                        LineKind::Remove => Style::default().fg(Color::Magenta),
+                        LineKind::Context => prefix_style,
+                    };
+                }
 
                 // Always feed the highlighter in order so its token state stays
                 // correct even when a context line is collapsed (not rendered).
@@ -181,8 +191,14 @@ pub fn render_diff(
                         spans.push(Span::styled(gutter, Style::default().fg(Color::DarkGray)));
                     }
                     spans.push(Span::styled(prefix.to_string(), prefix_style));
+                    // Emit the syntax-highlighted content, layering word-level
+                    // emphasis (underline) over the changed byte ranges. The
+                    // text is identical either way — only the style differs.
+                    let mut byte_pos = 0usize;
                     for (color, text) in highlighted {
-                        spans.push(Span::styled(text, Style::default().fg(color)));
+                        let len = text.len();
+                        push_content_spans(&mut spans, &text, byte_pos, color, &dl.emphasis);
+                        byte_pos += len;
                     }
                     out.push(Line::from(spans));
                 }
@@ -214,6 +230,61 @@ pub fn parse_hunk_new_start(header: &str) -> Option<usize> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+/// Append a syntax-highlighted content token (`text`, a slice of the line
+/// content starting at byte `start`) to `spans`, underlining the sub-segments
+/// that fall inside an `emphasis` byte range while keeping the syntax `color`.
+///
+/// The token is split only at emphasis boundaries, which sit on char boundaries
+/// (word-diff ranges and syntect tokens both respect UTF-8), so slicing is safe
+/// and the visible text is byte-for-byte unchanged — emphasis is style-only.
+fn push_content_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    start: usize,
+    color: Color,
+    emphasis: &[(usize, usize)],
+) {
+    if text.is_empty() {
+        return;
+    }
+    let base = Style::default().fg(color);
+    if emphasis.is_empty() {
+        spans.push(Span::styled(text.to_string(), base));
+        return;
+    }
+    // Walk the token's chars, flushing a span whenever the emphasized state
+    // flips so each emitted span is uniformly emphasized or not.
+    let mut seg_start = 0usize;
+    let mut cur = byte_emphasized(start, emphasis);
+    for (rel, _) in text.char_indices() {
+        if rel == 0 {
+            continue;
+        }
+        let here = byte_emphasized(start + rel, emphasis);
+        if here != cur {
+            spans.push(styled_segment(&text[seg_start..rel], base, cur));
+            seg_start = rel;
+            cur = here;
+        }
+    }
+    spans.push(styled_segment(&text[seg_start..], base, cur));
+}
+
+/// Whether byte position `pos` lies inside any emphasis range.
+fn byte_emphasized(pos: usize, emphasis: &[(usize, usize)]) -> bool {
+    emphasis.iter().any(|&(s, e)| pos >= s && pos < e)
+}
+
+/// A content sub-span with the base syntax style, underlined when emphasized.
+fn styled_segment(text: &str, base: Style, emphasized: bool) -> Span<'static> {
+    let style = if emphasized {
+        base.add_modifier(Modifier::UNDERLINED)
+    } else {
+        base
+    };
+    Span::styled(text.to_string(), style)
 }
 
 #[cfg(test)]
@@ -250,6 +321,43 @@ index e69de29..4b825dc 100644
             .unwrap();
 
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn word_emphasis_is_style_only_text_unchanged() {
+        use crate::worddiff::compute_word_emphasis;
+
+        // A diff with a genuinely modified line so word emphasis is non-empty.
+        let text = "\
+diff --git a/x.txt b/x.txt
+--- a/x.txt
++++ b/x.txt
+@@ -1,1 +1,1 @@
+-the quick brown fox
++the quick red fox
+";
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions::default();
+
+        let plain = parse_unified_diff(text);
+        let mut emphasized = parse_unified_diff(text);
+        compute_word_emphasis(&mut emphasized);
+
+        // Emphasis must actually be present (otherwise this test is vacuous).
+        let has_emphasis = emphasized.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|l| !l.emphasis.is_empty());
+        assert!(has_emphasis, "fixture produced no emphasis");
+
+        let render_text = |m: &DiffModel| -> Vec<String> {
+            render_lines(m, &highlighter, &opts)
+                .iter()
+                .map(|l| l.to_string())
+                .collect()
+        };
+        // The visible text is byte-for-byte identical with or without emphasis.
+        assert_eq!(render_text(&plain), render_text(&emphasized));
     }
 
     #[test]
