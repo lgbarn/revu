@@ -147,3 +147,166 @@ impl GitAdapter {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
+
+// These tests shell out to real git and synthesize untracked diffs against
+// `/dev/null`, so they only run on unix.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// Run a git command in `dir`, asserting it succeeds (fixture setup).
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("failed to spawn git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A repo with: a committed file modified but unstaged, a new staged file,
+    /// and an untracked file.
+    fn fixture_repo() -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+
+        fs::write(p.join("committed.txt"), "original\n").unwrap();
+        git(p, &["add", "committed.txt"]);
+        git(p, &["commit", "-q", "-m", "initial"]);
+
+        // Unstaged modification to the committed file.
+        fs::write(p.join("committed.txt"), "original\nUNSTAGED_LINE\n").unwrap();
+
+        // A brand-new file added to the index (staged-only).
+        fs::write(p.join("staged.txt"), "STAGED_LINE\n").unwrap();
+        git(p, &["add", "staged.txt"]);
+
+        // An untracked file (never added).
+        fs::write(p.join("untracked.txt"), "UNTRACKED_LINE\n").unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn diff_default_includes_unstaged_and_untracked() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec![],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(
+            out.contains("committed.txt"),
+            "missing committed.txt: {out}"
+        );
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing unstaged change: {out}"
+        );
+        assert!(
+            out.contains("untracked.txt"),
+            "missing untracked file: {out}"
+        );
+        assert!(
+            out.contains("UNTRACKED_LINE"),
+            "missing untracked content: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_staged_shows_staged_not_unstaged() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: true,
+                paths: vec![],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(out.contains("staged.txt"), "missing staged file: {out}");
+        assert!(out.contains("STAGED_LINE"), "missing staged content: {out}");
+        // Unstaged-only change and untracked files must not leak into --staged.
+        assert!(
+            !out.contains("UNSTAGED_LINE"),
+            "staged diff leaked unstaged: {out}"
+        );
+        assert!(
+            !out.contains("UNTRACKED_LINE"),
+            "staged diff leaked untracked: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_exclude_untracked_omits_untracked() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec![],
+                include_untracked: false,
+            })
+            .unwrap();
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing unstaged change: {out}"
+        );
+        assert!(
+            !out.contains("untracked.txt"),
+            "untracked not excluded: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_paths_scopes_to_pathspec() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec!["committed.txt".to_string()],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(out.contains("committed.txt"), "missing scoped file: {out}");
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing scoped change: {out}"
+        );
+        // The untracked file is outside the pathspec, so it must be excluded.
+        assert!(
+            !out.contains("untracked.txt"),
+            "pathspec did not scope: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_files_compares_arbitrary_files() {
+        let dir = tempdir().expect("tempdir");
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        fs::write(&left, "hello\n").unwrap();
+        fs::write(&right, "world\n").unwrap();
+
+        // No repo here; diff_files must not require one.
+        let adapter = GitAdapter::new();
+        let out = adapter
+            .diff_files(left.to_str().unwrap(), right.to_str().unwrap())
+            .unwrap();
+        assert!(out.contains("-hello"), "missing removed line: {out}");
+        assert!(out.contains("+world"), "missing added line: {out}");
+    }
+}
