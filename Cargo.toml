@@ -7,6 +7,15 @@ description = "A fast, memory-safe terminal diff/review tool (a Rust port of hun
 repository = "https://github.com/lgbarn/revu"
 readme = "README.md"
 
+# `cargo binstall revu` fetches the prebuilt release tarball instead of
+# compiling. These MUST stay in sync with .github/workflows/release.yml, which
+# uploads `revu-<target>.tar.gz` (binary at the archive root) to the GitHub
+# Release tagged `v<version>`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [dependencies]
 # clap: CLI parsing. ratatui: TUI rendering (re-exports crossterm, so no
 # separate crossterm dependency). anyhow: ergonomic error propagation.
