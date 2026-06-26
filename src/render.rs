@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 
 use crate::diff::{DiffLine, DiffModel, LineKind};
 use crate::highlight::Highlighter;
+use crate::theme::Theme;
 
 /// The layout the renderer emits: the classic unified (stack) view, or a
 /// side-by-side two-column (split) view. `Copy` so it lives cheaply on
@@ -115,10 +116,11 @@ pub fn file_summaries(model: &DiffModel) -> Vec<FileSummary> {
 pub fn render_lines(
     model: &DiffModel,
     highlighter: &Highlighter,
+    theme: &Theme,
     opts: &RenderOptions,
     width: u16,
 ) -> Vec<Line<'static>> {
-    render_diff(model, highlighter, opts, width).lines
+    render_diff(model, highlighter, theme, opts, width).lines
 }
 
 /// Render the model, also recording where each file begins so the UI can jump
@@ -131,10 +133,11 @@ pub fn render_lines(
 pub fn render_diff(
     model: &DiffModel,
     highlighter: &Highlighter,
+    theme: &Theme,
     opts: &RenderOptions,
     width: u16,
 ) -> RenderedDiff {
-    layout_rows(model, highlighter, opts, width)
+    layout_rows(model, highlighter, theme, opts, width)
 }
 
 /// Pure row generation over `(model, opts, width)`: the single entry point the
@@ -143,6 +146,7 @@ pub fn render_diff(
 fn layout_rows(
     model: &DiffModel,
     highlighter: &Highlighter,
+    theme: &Theme,
     opts: &RenderOptions,
     width: u16,
 ) -> RenderedDiff {
@@ -153,15 +157,20 @@ fn layout_rows(
         };
     }
     match opts.mode {
-        LayoutMode::Stack => stack_rows(model, highlighter, opts),
-        LayoutMode::Split => split_rows(model, highlighter, opts, width),
+        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts),
+        LayoutMode::Split => split_rows(model, highlighter, theme, opts, width),
     }
 }
 
 /// The unified (stack) layout: a flat list of styled lines, old/new interleaved.
 /// This is the original `render_diff` body, untouched, so its output stays
 /// byte-identical to before split was added.
-fn stack_rows(model: &DiffModel, highlighter: &Highlighter, opts: &RenderOptions) -> RenderedDiff {
+fn stack_rows(
+    model: &DiffModel,
+    highlighter: &Highlighter,
+    theme: &Theme,
+    opts: &RenderOptions,
+) -> RenderedDiff {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
     for file in &model.files {
@@ -170,14 +179,14 @@ fn stack_rows(model: &DiffModel, highlighter: &Highlighter, opts: &RenderOptions
         out.push(Line::from(Span::styled(
             format!("── {} ", file.path),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.file_header)
                 .add_modifier(Modifier::BOLD),
         )));
 
         if file.binary {
             out.push(Line::from(Span::styled(
                 "  (binary file differs)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.gutter),
             )));
         }
 
@@ -189,7 +198,7 @@ fn stack_rows(model: &DiffModel, highlighter: &Highlighter, opts: &RenderOptions
             if opts.hunk_headers {
                 out.push(Line::from(Span::styled(
                     hunk.header.clone(),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme.hunk_header),
                 )));
             }
 
@@ -207,17 +216,17 @@ fn stack_rows(model: &DiffModel, highlighter: &Highlighter, opts: &RenderOptions
                 // Add/Context advance the new-side counter; Remove does not (it
                 // only exists on the old side), so it gets a blank gutter.
                 let (prefix, mut prefix_style, on_new_side) = match dl.kind {
-                    LineKind::Add => ('+', Style::default().fg(Color::Green), true),
-                    LineKind::Remove => ('-', Style::default().fg(Color::Red), false),
-                    LineKind::Context => (' ', Style::default().fg(Color::Gray), true),
+                    LineKind::Add => ('+', Style::default().fg(theme.add), true),
+                    LineKind::Remove => ('-', Style::default().fg(theme.remove), false),
+                    LineKind::Context => (' ', Style::default().fg(theme.context), true),
                 };
-                // Moved lines (git `--color-moved`) get the zebra hues — cyan
-                // for the moved-in (+) side, magenta for the moved-out (-) side
-                // — so they read as relocations, not genuine add/removes.
+                // Moved lines (git `--color-moved`) get the zebra hues — the
+                // moved-in (+) side and moved-out (-) side each get their own
+                // theme hue so they read as relocations, not genuine add/removes.
                 if dl.moved {
                     prefix_style = match dl.kind {
-                        LineKind::Add => Style::default().fg(Color::Cyan),
-                        LineKind::Remove => Style::default().fg(Color::Magenta),
+                        LineKind::Add => Style::default().fg(theme.moved_add),
+                        LineKind::Remove => Style::default().fg(theme.moved_remove),
                         LineKind::Context => prefix_style,
                     };
                 }
@@ -234,7 +243,7 @@ fn stack_rows(model: &DiffModel, highlighter: &Highlighter, opts: &RenderOptions
                             (true, Some(n)) => format!("{n:>4} "),
                             _ => BLANK_GUTTER.to_string(),
                         };
-                        spans.push(Span::styled(gutter, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(gutter, Style::default().fg(theme.gutter)));
                     }
                     spans.push(Span::styled(prefix.to_string(), prefix_style));
                     // Emit the syntax-highlighted content, layering word-level
@@ -279,6 +288,7 @@ const SEP: u16 = 1;
 fn split_rows(
     model: &DiffModel,
     highlighter: &Highlighter,
+    theme: &Theme,
     opts: &RenderOptions,
     width: u16,
 ) -> RenderedDiff {
@@ -292,14 +302,14 @@ fn split_rows(
         out.push(Line::from(Span::styled(
             format!("── {} ", file.path),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.file_header)
                 .add_modifier(Modifier::BOLD),
         )));
 
         if file.binary {
             out.push(Line::from(Span::styled(
                 "  (binary file differs)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.gutter),
             )));
         }
 
@@ -309,7 +319,7 @@ fn split_rows(
             if opts.hunk_headers {
                 out.push(Line::from(Span::styled(
                     hunk.header.clone(),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme.hunk_header),
                 )));
             }
 
@@ -333,9 +343,9 @@ fn split_rows(
                 let dl = &hunk.lines[i];
                 if dl.kind == LineKind::Context {
                     if !opts.context_collapsed {
-                        let left = build_cell(dl, &highlighted[i], old_line, opts, col_w);
-                        let right = build_cell(dl, &highlighted[i], new_line, opts, col_w);
-                        out.push(compose_row(left, right));
+                        let left = build_cell(dl, &highlighted[i], old_line, theme, opts, col_w);
+                        let right = build_cell(dl, &highlighted[i], new_line, theme, opts, col_w);
+                        out.push(compose_row(left, right, theme));
                     }
                     old_line = old_line.map(|n| n + 1);
                     new_line = new_line.map(|n| n + 1);
@@ -364,6 +374,7 @@ fn split_rows(
                                 &hunk.lines[idx],
                                 &highlighted[idx],
                                 old_line,
+                                theme,
                                 opts,
                                 col_w,
                             );
@@ -378,6 +389,7 @@ fn split_rows(
                                 &hunk.lines[idx],
                                 &highlighted[idx],
                                 new_line,
+                                theme,
                                 opts,
                                 col_w,
                             );
@@ -386,7 +398,7 @@ fn split_rows(
                         }
                         None => blank_cell(col_w),
                     };
-                    out.push(compose_row(left, right));
+                    out.push(compose_row(left, right, theme));
                 }
             }
         }
@@ -407,17 +419,18 @@ fn build_cell(
     dl: &DiffLine,
     highlighted: &[(Color, String)],
     gutter: Option<usize>,
+    theme: &Theme,
     opts: &RenderOptions,
     col_w: usize,
 ) -> Vec<Span<'static>> {
-    let (prefix, prefix_style) = prefix_for(dl);
+    let (prefix, prefix_style) = prefix_for(dl, theme);
     let mut spans: Vec<Span<'static>> = Vec::new();
     if opts.line_numbers {
         let g = match gutter {
             Some(n) => format!("{n:>4} "),
             None => BLANK_GUTTER.to_string(),
         };
-        spans.push(Span::styled(g, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(g, Style::default().fg(theme.gutter)));
     }
     spans.push(Span::styled(prefix.to_string(), prefix_style));
     append_content_spans(&mut spans, highlighted, &dl.emphasis);
@@ -432,16 +445,16 @@ fn blank_cell(col_w: usize) -> Vec<Span<'static>> {
 /// The leading prefix char and its style for a diff line, matching stack: green
 /// `+` / red `-` / gray space, with git `--color-moved` lines recolored to the
 /// cyan/magenta zebra hues.
-fn prefix_for(dl: &DiffLine) -> (char, Style) {
+fn prefix_for(dl: &DiffLine, theme: &Theme) -> (char, Style) {
     let (prefix, mut style) = match dl.kind {
-        LineKind::Add => ('+', Style::default().fg(Color::Green)),
-        LineKind::Remove => ('-', Style::default().fg(Color::Red)),
-        LineKind::Context => (' ', Style::default().fg(Color::Gray)),
+        LineKind::Add => ('+', Style::default().fg(theme.add)),
+        LineKind::Remove => ('-', Style::default().fg(theme.remove)),
+        LineKind::Context => (' ', Style::default().fg(theme.context)),
     };
     if dl.moved {
         style = match dl.kind {
-            LineKind::Add => Style::default().fg(Color::Cyan),
-            LineKind::Remove => Style::default().fg(Color::Magenta),
+            LineKind::Add => Style::default().fg(theme.moved_add),
+            LineKind::Remove => Style::default().fg(theme.moved_remove),
             LineKind::Context => style,
         };
     }
@@ -495,8 +508,12 @@ fn fit_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 }
 
 /// Compose a left cell, the column separator, and a right cell into one line.
-fn compose_row(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>) -> Line<'static> {
-    left.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+fn compose_row(
+    mut left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    theme: &Theme,
+) -> Line<'static> {
+    left.push(Span::styled("│", Style::default().fg(theme.gutter)));
     left.extend(right);
     Line::from(left)
 }
@@ -610,7 +627,13 @@ index e69de29..4b825dc 100644
     fn renders_diff_to_buffer() {
         let model = parse_unified_diff(SAMPLE);
         let highlighter = Highlighter::new();
-        let lines = render_lines(&model, &highlighter, &RenderOptions::default(), 50);
+        let lines = render_lines(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            50,
+        );
 
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -649,7 +672,7 @@ diff --git a/x.txt b/x.txt
         assert!(has_emphasis, "fixture produced no emphasis");
 
         let render_text = |m: &DiffModel| -> Vec<String> {
-            render_lines(m, &highlighter, &opts, 80)
+            render_lines(m, &highlighter, &Theme::default(), &opts, 80)
                 .iter()
                 .map(|l| l.to_string())
                 .collect()
@@ -664,6 +687,7 @@ diff --git a/x.txt b/x.txt
         let lines = render_lines(
             &DiffModel::default(),
             &highlighter,
+            &Theme::default(),
             &RenderOptions::default(),
             80,
         );
@@ -678,7 +702,7 @@ diff --git a/x.txt b/x.txt
             hunk_headers: false,
             ..RenderOptions::default()
         };
-        let lines = render_lines(&model, &highlighter, &opts, 80);
+        let lines = render_lines(&model, &highlighter, &Theme::default(), &opts, 80);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(
             !text.iter().any(|l| l.starts_with("@@")),
@@ -695,7 +719,7 @@ diff --git a/x.txt b/x.txt
             context_collapsed: true,
             ..RenderOptions::default()
         };
-        let lines = render_lines(&model, &highlighter, &opts, 80);
+        let lines = render_lines(&model, &highlighter, &Theme::default(), &opts, 80);
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // The context rows " fn main() {" and " }" must be gone; add/remove stay.
         assert!(
@@ -713,7 +737,13 @@ diff --git a/x.txt b/x.txt
     fn line_numbers_gutter_uses_new_side_numbering() {
         let model = parse_unified_diff(SAMPLE);
         let highlighter = Highlighter::new();
-        let lines = render_lines(&model, &highlighter, &RenderOptions::default(), 80);
+        let lines = render_lines(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            80,
+        );
         let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // Context "fn main" is new line 1; the added "new" line is new line 2.
         assert!(
@@ -773,7 +803,13 @@ index 3333333..4444444 100644
     fn render_diff_file_starts_point_at_each_file_header() {
         let model = parse_unified_diff(TWO_FILE);
         let highlighter = Highlighter::new();
-        let rendered = render_diff(&model, &highlighter, &RenderOptions::default(), 80);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            80,
+        );
 
         // One entry per file, strictly ascending.
         assert_eq!(rendered.file_starts.len(), 2);
@@ -792,8 +828,8 @@ index 3333333..4444444 100644
         let model = parse_unified_diff(TWO_FILE);
         let highlighter = Highlighter::new();
         let opts = RenderOptions::default();
-        let plain = render_lines(&model, &highlighter, &opts, 80);
-        let rendered = render_diff(&model, &highlighter, &opts, 80);
+        let plain = render_lines(&model, &highlighter, &Theme::default(), &opts, 80);
+        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, 80);
         assert_eq!(plain.len(), rendered.lines.len());
     }
 
@@ -835,7 +871,7 @@ index 3333333..4444444 100644
             mode: LayoutMode::Split,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &opts, width);
+        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, width);
         let col_w = ((width - SEP) / 2) as usize;
 
         // Every composed paired row contains exactly one separator, and the left
@@ -888,10 +924,17 @@ index 3333333..4444444 100644
     fn stack_and_split_produce_distinct_shapes() {
         let model = parse_unified_diff(TWO_FILE);
         let highlighter = Highlighter::new();
-        let stack = render_diff(&model, &highlighter, &RenderOptions::default(), 80);
+        let stack = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            80,
+        );
         let split = render_diff(
             &model,
             &highlighter,
+            &Theme::default(),
             &RenderOptions {
                 mode: LayoutMode::Split,
                 ..RenderOptions::default()
@@ -931,7 +974,7 @@ diff --git a/x.txt b/x.txt
             mode: LayoutMode::Split,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &opts, width);
+        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, width);
         let col_w = ((width - SEP) / 2) as usize;
 
         let row_with = |needle: &str| -> String {
@@ -984,7 +1027,7 @@ diff --git a/u.txt b/u.txt
         };
         // Widths from pathological (0/1/2) up to comfortable must all render.
         for w in [0u16, 1, 2, 3, 10, 40] {
-            let rendered = render_diff(&model, &highlighter, &opts, w);
+            let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, w);
             assert!(!rendered.lines.is_empty(), "width {w} produced no rows");
         }
     }
@@ -997,7 +1040,7 @@ diff --git a/u.txt b/u.txt
             mode: LayoutMode::Split,
             ..RenderOptions::default()
         };
-        let lines = render_lines(&model, &highlighter, &opts, 120);
+        let lines = render_lines(&model, &highlighter, &Theme::default(), &opts, 120);
 
         let backend = TestBackend::new(120, 20);
         let mut terminal = Terminal::new(backend).unwrap();
