@@ -142,6 +142,35 @@ Themes: `github-light`, `github-dark`, `catppuccin-mocha`, `dracula`, `nord`,
 v0.1.0 — the full review feature set is implemented and tested. revu is young;
 issues and PRs welcome.
 
+## Releasing
+
+Pushing a `v*` tag triggers the release workflow, which:
+
+1. creates the GitHub Release,
+2. builds and uploads static binaries for all four targets, and
+3. regenerates the Homebrew formula (from `packaging/homebrew/revu.rb`) with the
+   new version + checksums and pushes it to the tap — so `brew upgrade` just
+   works, no manual formula edits.
+
+```sh
+# bump version in Cargo.toml first, then:
+git tag -a vX.Y.Z -m "revu vX.Y.Z" && git push origin vX.Y.Z
+```
+
+**One-time setup for the auto-tap-update** (step 3): the release runs in this
+repo and the default token can't write to the separate tap repo, so add a
+cross-repo token once:
+
+1. Create a fine-grained PAT with **Contents: read and write** scoped to
+   `lgbarn/homebrew-tap`.
+2. Store it as an Actions secret in this repo:
+   ```sh
+   gh secret set HOMEBREW_TAP_TOKEN --repo lgbarn/revu
+   ```
+
+Without the secret the release still publishes binaries; only the tap update is
+skipped (with a warning).
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
