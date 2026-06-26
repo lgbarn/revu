@@ -16,7 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::highlight::Highlighter;
-use crate::render::{file_summaries, render_diff, FileSummary, RenderOptions};
+use crate::render::{file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions};
 use crate::state::ViewState;
 use crate::vcs::git::GitAdapter;
 use crate::vcs::{DiffOptions, VcsAdapter};
@@ -120,6 +120,9 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
         hunk_headers: config.hunk_headers,
         // No config key for context collapse — it is a view-state-only toggle.
         context_collapsed: false,
+        // The effective layout is resolved per frame in `run_loop` from the
+        // config `mode` string + terminal width; this seed is overwritten there.
+        mode: LayoutMode::Stack,
     };
     let mut wrap = config.wrap_lines;
     if let Some(state) = ViewState::load() {
@@ -140,7 +143,7 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
     // `ratatui::init` installs a panic hook that restores the terminal, so a
     // crash mid-render won't leave the user in a broken alternate screen.
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, &model, &highlighter, opts, wrap);
+    let result = run_loop(&mut terminal, &model, &highlighter, opts, wrap, config.mode);
     ratatui::restore();
     result
 }
@@ -167,6 +170,41 @@ fn reopen_controlling_tty() -> Result<()> {
 /// hidden when the terminal is too narrow to leave room for the main view.
 const SIDEBAR_W: u16 = 28;
 
+/// Minimum main-content width (columns) at which `--mode auto` switches from the
+/// unified (stack) view to the side-by-side (split) view. Below this a split
+/// would give each side ~55 cols or fewer, which is too cramped for code; above
+/// it, two columns read comfortably.
+const AUTO_SPLIT_MIN: u16 = 120;
+
+/// Resolve the configured mode string + current main-content width into the
+/// concrete layout the renderer needs. `auto` (and any unrecognized value)
+/// picks split once the width reaches [`AUTO_SPLIT_MIN`], else stack — this is
+/// re-evaluated every frame so a terminal resize flips the layout live.
+fn effective_mode(mode: &str, width: u16) -> LayoutMode {
+    match mode {
+        "split" => LayoutMode::Split,
+        "stack" | "unified" => LayoutMode::Stack,
+        _ => {
+            if width >= AUTO_SPLIT_MIN {
+                LayoutMode::Split
+            } else {
+                LayoutMode::Stack
+            }
+        }
+    }
+}
+
+/// The main-content width for a given terminal width: the full width, minus the
+/// sidebar when it is visible and there is room for it (mirrors the split in
+/// [`draw_review`]). Used to size split columns and drive `auto` selection.
+fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
+    if sidebar_visible && term_width >= SIDEBAR_W + 20 {
+        term_width - SIDEBAR_W
+    } else {
+        term_width
+    }
+}
+
 /// The interactive review loop. Owns the diff model + highlighter + render
 /// options so display toggles can RE-RENDER the lines in place (rather than
 /// re-running the whole pipeline). Persists the final toggle state to
@@ -177,19 +215,48 @@ fn run_loop(
     highlighter: &Highlighter,
     mut opts: RenderOptions,
     mut wrap: bool,
+    mut mode: String,
 ) -> Result<()> {
     let file_count = model.files.len();
-    let initial = render_diff(model, highlighter, &opts);
-    let mut lines = initial.lines;
-    let mut file_starts = initial.file_starts;
+    // Rendered lines are (re)built lazily inside the loop: the first iteration
+    // always renders, and thereafter only when the effective layout mode, the
+    // split column width, or a display toggle changes.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::new();
     let summaries = file_summaries(model);
     let mut offset: u16 = 0;
     let mut show_help = false;
     // Sidebar starts visible; selection tracks which file the main view is on.
     let mut sidebar_visible = true;
     let mut selected_file: usize = 0;
+    // Render cache: the mode/width the current `lines` were built for, plus a
+    // dirty flag set by display toggles. `None` mode forces the first render.
+    let mut cur_mode: Option<LayoutMode> = None;
+    let mut cur_width: u16 = 0;
+    let mut needs_render = true;
 
     loop {
+        // Resolve the effective layout from the configured mode + live width so a
+        // resize (which changes the width here) re-evaluates `auto` and split
+        // column sizing without any extra event.
+        let term_width = terminal.size()?.width;
+        let main_width = main_content_width(term_width, sidebar_visible);
+        let eff_mode = effective_mode(&mode, main_width);
+        // Rebuild lines only when something that affects them changed: a toggle
+        // (needs_render), the layout mode, or — for split — the column width.
+        if needs_render
+            || cur_mode != Some(eff_mode)
+            || (eff_mode == LayoutMode::Split && main_width != cur_width)
+        {
+            opts.mode = eff_mode;
+            let r = render_diff(model, highlighter, &opts, main_width);
+            lines = r.lines;
+            file_starts = r.file_starts;
+            cur_mode = Some(eff_mode);
+            cur_width = main_width;
+            needs_render = false;
+        }
+
         // Clamp rather than `as u16` so a diff over 65535 lines saturates
         // instead of silently wrapping the scroll bound.
         let total = lines.len().min(u16::MAX as usize) as u16;
@@ -258,22 +325,26 @@ fn run_loop(
                 // per-file offsets are refreshed alongside the lines.
                 KeyCode::Char('n') => {
                     opts.line_numbers = !opts.line_numbers;
-                    let r = render_diff(model, highlighter, &opts);
-                    lines = r.lines;
-                    file_starts = r.file_starts;
+                    needs_render = true;
                 }
                 KeyCode::Char('w') => wrap = !wrap,
                 KeyCode::Char('H') => {
                     opts.hunk_headers = !opts.hunk_headers;
-                    let r = render_diff(model, highlighter, &opts);
-                    lines = r.lines;
-                    file_starts = r.file_starts;
+                    needs_render = true;
                 }
                 KeyCode::Char('c') => {
                     opts.context_collapsed = !opts.context_collapsed;
-                    let r = render_diff(model, highlighter, &opts);
-                    lines = r.lines;
-                    file_starts = r.file_starts;
+                    needs_render = true;
+                }
+                // Cycle the layout mode auto -> split -> stack -> auto. The next
+                // loop iteration re-resolves the effective mode and re-renders.
+                KeyCode::Char('m') => {
+                    mode = match mode.as_str() {
+                        "auto" => "split".to_string(),
+                        "split" => "stack".to_string(),
+                        _ => "auto".to_string(),
+                    };
+                    needs_render = true;
                 }
                 // Sidebar: toggle visibility and navigate between files. Moving
                 // selection jumps the main view to that file's start offset.
@@ -516,7 +587,12 @@ fn status_bar(
     };
 
     // Show only the toggles that are currently ON, mirroring the help labels.
+    // SPLIT is shown only when the side-by-side layout is active; in the default
+    // stack layout the mode is implicit (and the indicator stays absent).
     let mut active: Vec<&str> = Vec::new();
+    if opts.mode == LayoutMode::Split {
+        active.push("SPLIT");
+    }
     if opts.line_numbers {
         active.push("LN");
     }
@@ -570,6 +646,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "  w   toggle line wrap",
         "  H   toggle hunk headers",
         "  c   toggle context collapse",
+        "  m   cycle layout auto/split/stack",
         "",
         "  e   open file in $EDITOR",
         "  Ctrl-Z suspend  Ctrl-C quit",
@@ -678,7 +755,7 @@ index 5555555..6666666 100644
         let model = parse_unified_diff_colored(MULTI_FILE);
         let highlighter = Highlighter::new();
         let opts = RenderOptions::default();
-        let rendered = render_diff(&model, &highlighter, &opts);
+        let rendered = render_diff(&model, &highlighter, &opts, 80);
         let summaries = file_summaries(&model);
 
         // Select the second file and scroll the main view to its start.
@@ -698,6 +775,80 @@ index 5555555..6666666 100644
         };
 
         let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_review(f, &view);
+            })
+            .unwrap();
+
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn effective_mode_resolves_explicit_and_auto() {
+        // Explicit modes ignore width.
+        assert_eq!(effective_mode("split", 1), LayoutMode::Split);
+        assert_eq!(effective_mode("stack", 9999), LayoutMode::Stack);
+        assert_eq!(effective_mode("unified", 9999), LayoutMode::Stack);
+        // Auto (and unknown values) switch at AUTO_SPLIT_MIN.
+        assert_eq!(
+            effective_mode("auto", AUTO_SPLIT_MIN - 1),
+            LayoutMode::Stack
+        );
+        assert_eq!(effective_mode("auto", AUTO_SPLIT_MIN), LayoutMode::Split);
+        assert_eq!(effective_mode("bogus", AUTO_SPLIT_MIN), LayoutMode::Split);
+    }
+
+    #[test]
+    fn main_content_width_accounts_for_sidebar() {
+        // Wide enough: full width minus the sidebar.
+        assert_eq!(main_content_width(160, true), 160 - SIDEBAR_W);
+        // Sidebar hidden: full width.
+        assert_eq!(main_content_width(160, false), 160);
+        // Too narrow for the sidebar: it is dropped, so full width.
+        assert_eq!(main_content_width(30, true), 30);
+    }
+
+    #[test]
+    fn renders_auto_split_when_wide() {
+        // `auto` at a wide main width selects split; render the full frame the
+        // way run_loop would (mode resolved, then drawn) so the snapshot covers
+        // the split main view + the SPLIT status-bar indicator.
+        let model = parse_unified_diff_colored(MULTI_FILE);
+        let highlighter = Highlighter::new();
+
+        // Sidebar hidden so the whole 130-col width is the main content; auto
+        // then resolves to split (130 >= AUTO_SPLIT_MIN).
+        let sidebar_visible = false;
+        let main_width = main_content_width(130, sidebar_visible);
+        let mode = effective_mode("auto", main_width);
+        assert_eq!(
+            mode,
+            LayoutMode::Split,
+            "auto should pick split at 130 cols"
+        );
+
+        let opts = RenderOptions {
+            mode,
+            ..RenderOptions::default()
+        };
+        let rendered = render_diff(&model, &highlighter, &opts, main_width);
+        let summaries = file_summaries(&model);
+        let view = ReviewFrame {
+            lines: &rendered.lines,
+            summaries: &summaries,
+            opts: &opts,
+            file_count: model.files.len(),
+            selected_file: 0,
+            offset: 0,
+            total: rendered.lines.len() as u16,
+            wrap: false,
+            sidebar_visible,
+            show_help: false,
+        };
+
+        let backend = TestBackend::new(130, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {

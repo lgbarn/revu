@@ -1,0 +1,24 @@
+---
+source: src/render.rs
+expression: terminal.backend()
+---
+"── a.txt                                                                                                                "
+"@@ -1,2 +1,2 @@                                                                                                         "
+"   1  keep                                                 │   1  keep                                                  "
+"   2 -old                                                  │   2 +new                                                   "
+"@@ -10 +10,2 @@                                                                                                         "
+"  10  ctx                                                  │  10  ctx                                                   "
+"                                                           │  11 +added                                                 "
+"                                                                                                                        "
+"── b.txt                                                                                                                "
+"@@ -1 +1 @@                                                                                                             "
+"   1 -removed                                              │   1 +inserted                                              "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
