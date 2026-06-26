@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod diff;
+mod highlight;
 mod pager;
 mod render;
 mod vcs;
