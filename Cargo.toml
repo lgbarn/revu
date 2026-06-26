@@ -32,11 +32,12 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
 
-# rustix (pure Rust, no libc) only for dup2'ing /dev/tty onto stdin when a diff
-# is piped in (pager mode). Same 0.38 version crossterm already links, so this
-# enables the `stdio` feature on the existing copy rather than adding a crate.
+# rustix (pure Rust, no libc) for two unix needs: `stdio` dup2's /dev/tty onto
+# stdin when a diff is piped in (pager mode); `process` raises SIGTSTP on our own
+# pid for Ctrl-Z suspend in the TUI. Same 0.38 version crossterm already links,
+# so this only enables features on the existing copy rather than adding a crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["stdio"] }
+rustix = { version = "0.38", features = ["stdio", "process"] }
 
 [dev-dependencies]
 # insta: snapshot testing of rendered terminal buffers.
