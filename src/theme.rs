@@ -49,6 +49,13 @@ pub struct Theme {
     pub add_bg: Color,
     /// Full-row background tint behind removed (`-`) lines. Companion to `add_bg`.
     pub remove_bg: Color,
+    /// Word-emphasis background for changed tokens on added lines: a medium tint,
+    /// clearly stronger than the subtle row `add_bg` but well short of the vivid
+    /// `add` foreground, so intra-line emphasis reads without a jarring bright box.
+    pub add_emph_bg: Color,
+    /// Word-emphasis background for changed tokens on removed lines. Companion to
+    /// `add_emph_bg`; a medium tint between `remove_bg` and `remove`.
+    pub remove_emph_bg: Color,
     /// Context (` `) line prefix.
     pub context: Color,
     /// Line-number gutter, the binary-file note, and the split separator.
@@ -95,6 +102,8 @@ fn mk(
     remove: u32,
     add_bg: u32,
     remove_bg: u32,
+    add_emph_bg: u32,
+    remove_emph_bg: u32,
     context: u32,
     gutter: u32,
     moved_add: u32,
@@ -112,6 +121,8 @@ fn mk(
         remove: rgb(remove),
         add_bg: rgb(add_bg),
         remove_bg: rgb(remove_bg),
+        add_emph_bg: rgb(add_emph_bg),
+        remove_emph_bg: rgb(remove_emph_bg),
         context: rgb(context),
         gutter: rgb(gutter),
         moved_add: rgb(moved_add),
@@ -130,7 +141,7 @@ fn mk(
 /// the tests so a typo can't panic at runtime).
 pub fn catalog() -> Vec<Theme> {
     vec![
-        // name, dark, syntect, header, hunk, add, remove, add_bg, remove_bg, context, gutter, moved+, moved-, selection, status_fg, status_bg
+        // name, dark, syntect, header, hunk, add, remove, add_bg, remove_bg, add_emph_bg, remove_emph_bg, context, gutter, moved+, moved-, selection, status_fg, status_bg
         mk(
             "github-light",
             false,
@@ -141,6 +152,8 @@ pub fn catalog() -> Vec<Theme> {
             0xcf222e,
             0xe6ffed,
             0xffeef0,
+            0xabf2bc,
+            0xfdb8c0,
             0x57606a,
             0x8c959f,
             0x0969da,
@@ -159,6 +172,8 @@ pub fn catalog() -> Vec<Theme> {
             0xf85149,
             0x12261c,
             0x2d1517,
+            0x1e5230,
+            0x5c2a2c,
             0x8b949e,
             0x484f58,
             0x58a6ff,
@@ -177,6 +192,8 @@ pub fn catalog() -> Vec<Theme> {
             0xf38ba8,
             0x1f3328,
             0x35202b,
+            0x315c42,
+            0x5e3140,
             0xa6adc8,
             0x585b70,
             0x89dceb,
@@ -195,6 +212,8 @@ pub fn catalog() -> Vec<Theme> {
             0xff5555,
             0x1d3327,
             0x3a2128,
+            0x2a5c3e,
+            0x5e2f33,
             0x6272a4,
             0x44475a,
             0x8be9fd,
@@ -213,6 +232,8 @@ pub fn catalog() -> Vec<Theme> {
             0xbf616a,
             0x20342a,
             0x382229,
+            0x35543f,
+            0x573439,
             0xd8dee9,
             0x4c566a,
             0x8fbcbb,
@@ -231,6 +252,8 @@ pub fn catalog() -> Vec<Theme> {
             0xf7768e,
             0x1b3328,
             0x33202a,
+            0x305839,
+            0x5c2f3c,
             0xa9b1d6,
             0x414868,
             0x7dcfff,
@@ -249,6 +272,8 @@ pub fn catalog() -> Vec<Theme> {
             0xfb4934,
             0x2a3320,
             0x3a221c,
+            0x4a5226,
+            0x5e2f26,
             0xa89984,
             0x504945,
             0x83a598,
@@ -267,6 +292,8 @@ pub fn catalog() -> Vec<Theme> {
             0x9d0006,
             0xe4ecca,
             0xf6ddc9,
+            0xc7d49a,
+            0xf0b6a8,
             0x7c6f64,
             0xbdae93,
             0x076678,
@@ -285,6 +312,8 @@ pub fn catalog() -> Vec<Theme> {
             0xdc322f,
             0x123a2c,
             0x3a2024,
+            0x32502a,
+            0x5e2c2e,
             0x93a1a1,
             0x586e75,
             0x2aa198,
@@ -303,6 +332,8 @@ pub fn catalog() -> Vec<Theme> {
             0xdc322f,
             0xe6ecc8,
             0xf6ddcc,
+            0xc9d79a,
+            0xf2b8ac,
             0x657b83,
             0x93a1a1,
             0x2aa198,
@@ -321,6 +352,8 @@ pub fn catalog() -> Vec<Theme> {
             0xf92672,
             0x26331d,
             0x3a1f2a,
+            0x44552a,
+            0x5e2a40,
             0x75715e,
             0x49483e,
             0x66d9ef,
@@ -339,6 +372,8 @@ pub fn catalog() -> Vec<Theme> {
             0xe06c75,
             0x1d3326,
             0x33202a,
+            0x365840,
+            0x5a3038,
             0xabb2bf,
             0x5c6370,
             0x56b6c2,
@@ -416,6 +451,8 @@ fn apply_ui_overrides(theme: &mut Theme, colors: &BTreeMap<String, String>) -> R
             "removed" | "remove" => theme.remove = color,
             "added_bg" | "add_bg" => theme.add_bg = color,
             "removed_bg" | "remove_bg" => theme.remove_bg = color,
+            "added_emph_bg" | "add_emph_bg" => theme.add_emph_bg = color,
+            "removed_emph_bg" | "remove_emph_bg" => theme.remove_emph_bg = color,
             "context" => theme.context = color,
             "file_header" | "header" => theme.file_header = color,
             "hunk_header" | "hunk" => theme.hunk_header = color,
@@ -528,6 +565,24 @@ mod tests {
                 "theme {:?} has identical add_bg/remove_bg tints",
                 t.name
             );
+            // The word-emphasis tints are likewise distinct per change kind, and
+            // are a different (medium) intensity than the subtle row tint so
+            // emphasized tokens stand out from the rest of the row.
+            assert_ne!(
+                t.add_emph_bg, t.remove_emph_bg,
+                "theme {:?} has identical add/remove emphasis tints",
+                t.name
+            );
+            assert_ne!(
+                t.add_emph_bg, t.add_bg,
+                "theme {:?} add emphasis tint equals its row tint",
+                t.name
+            );
+            assert_ne!(
+                t.remove_emph_bg, t.remove_bg,
+                "theme {:?} remove emphasis tint equals its row tint",
+                t.name
+            );
         }
     }
 
@@ -611,6 +666,55 @@ mod tests {
         assert_eq!(resolved.remove_bg, Color::Rgb(0x20, 0x10, 0x10));
         assert_ne!(resolved.add_bg, base.add_bg);
         assert_ne!(resolved.remove_bg, base.remove_bg);
+    }
+
+    #[test]
+    fn custom_theme_overrides_emphasis_tints() {
+        let base = resolve_theme(&cfg_with_theme("nord"), true).unwrap();
+
+        let mut colors = BTreeMap::new();
+        colors.insert("add_emph_bg".to_string(), "#306030".to_string());
+        colors.insert("remove_emph_bg".to_string(), "#603030".to_string());
+        let cfg = Config {
+            theme: "nord".to_string(),
+            custom_theme: Some(CustomTheme {
+                base: None,
+                label: None,
+                syntax: None,
+                colors,
+            }),
+            ..Config::default()
+        };
+
+        let resolved = resolve_theme(&cfg, true).unwrap();
+        assert_eq!(resolved.add_emph_bg, Color::Rgb(0x30, 0x60, 0x30));
+        assert_eq!(resolved.remove_emph_bg, Color::Rgb(0x60, 0x30, 0x30));
+        assert_ne!(resolved.add_emph_bg, base.add_emph_bg);
+        assert_ne!(resolved.remove_emph_bg, base.remove_emph_bg);
+        // The row tints are untouched by an emphasis-only override.
+        assert_eq!(resolved.add_bg, base.add_bg);
+        assert_eq!(resolved.remove_bg, base.remove_bg);
+    }
+
+    #[test]
+    fn custom_theme_invalid_emphasis_tint_hex_is_rejected() {
+        let mut colors = BTreeMap::new();
+        colors.insert("remove_emph_bg".to_string(), "#nothex".to_string());
+        let cfg = Config {
+            theme: "nord".to_string(),
+            custom_theme: Some(CustomTheme {
+                base: None,
+                label: None,
+                syntax: None,
+                colors,
+            }),
+            ..Config::default()
+        };
+        let err = resolve_theme(&cfg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid hex color"),
+            "expected a clear invalid-hex error, got: {err}"
+        );
     }
 
     #[test]
