@@ -6,6 +6,7 @@ mod highlight;
 mod pager;
 mod render;
 mod state;
+mod theme;
 mod vcs;
 mod worddiff;
 
