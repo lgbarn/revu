@@ -31,7 +31,10 @@ pub fn run_diff() -> Result<()> {
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, lines: &[Line<'static>]) -> Result<()> {
-    let total = lines.len() as u16;
+    // Clamp rather than `as u16` so a diff over 65535 lines saturates instead
+    // of silently wrapping the scroll bound. (Paragraph scroll is u16-bound
+    // anyway, so this is the most the simple stack view can address.)
+    let total = lines.len().min(u16::MAX as usize) as u16;
     let mut offset: u16 = 0;
 
     loop {
