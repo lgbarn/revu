@@ -27,8 +27,10 @@ pub enum LayoutMode {
 /// property (line wrapping is not a line-content concern).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderOptions {
-    /// Render a right-aligned line-number gutter (old-side on the left column,
-    /// new-side on the right column in split; new-side only in stack).
+    /// Render a right-aligned line-number gutter. Stack shows BOTH old and new
+    /// columns per line (context both, remove old-only, add new-only); split
+    /// shows old on the left cell and new on the right. The left change-bar is
+    /// drawn regardless of this toggle.
     pub line_numbers: bool,
     /// Emit the `@@ ... @@` hunk header lines.
     pub hunk_headers: bool,
@@ -162,12 +164,78 @@ fn layout_rows(
     }
 }
 
+/// Width (in digit columns) of each numeric gutter column for the whole model:
+/// the digit count of the largest old- or new-side line number reached across
+/// every hunk, floored at 3 so single-digit diffs still get a steady gutter.
+/// Computed once per render so every line shares one column width.
+fn gutter_width(model: &DiffModel) -> usize {
+    let mut max_line = 0usize;
+    for file in &model.files {
+        for hunk in &file.hunks {
+            let mut old = parse_hunk_old_start(&hunk.header);
+            let mut new = parse_hunk_new_start(&hunk.header);
+            for dl in &hunk.lines {
+                // A line's number is its counter's value before the increment;
+                // the counter advances on the side(s) the line exists on.
+                match dl.kind {
+                    LineKind::Context => {
+                        if let Some(o) = old {
+                            max_line = max_line.max(o);
+                            old = Some(o + 1);
+                        }
+                        if let Some(n) = new {
+                            max_line = max_line.max(n);
+                            new = Some(n + 1);
+                        }
+                    }
+                    LineKind::Remove => {
+                        if let Some(o) = old {
+                            max_line = max_line.max(o);
+                            old = Some(o + 1);
+                        }
+                    }
+                    LineKind::Add => {
+                        if let Some(n) = new {
+                            max_line = max_line.max(n);
+                            new = Some(n + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let digits = if max_line == 0 {
+        1
+    } else {
+        max_line.ilog10() as usize + 1
+    };
+    digits.max(3)
+}
+
+/// Format one numeric gutter cell, right-aligned to `w`; `None` (the absent
+/// side of an add/remove line, or an unparseable header) renders `w` spaces.
+fn gutter_cell(n: Option<usize>, w: usize) -> String {
+    match n {
+        Some(v) => format!("{v:>w$}"),
+        None => " ".repeat(w),
+    }
+}
+
 /// The unified (stack) layout: a flat list of styled lines, old/new interleaved.
+///
+/// Each diff line is laid out left-to-right as
+/// `[change-bar(1)][old#(W)] [new#(W)] [prefix(1)][content...][row-pad]`:
+/// a 1-column change-indicator bar (vivid add/remove background, blank for
+/// context), then — when `opts.line_numbers` is on — the dual old/new line-number
+/// gutter (context shows both, remove old-only, add new-only), then the
+/// `+`/`-`/space prefix and the syntax-highlighted content.
 ///
 /// `width` is used only to right-pad added/removed rows with spaces so their
 /// background tint spans the full row. Padding with spaces leaves the rendered
-/// *symbols* identical to the terminal's own blank-cell fill, so snapshots are
-/// unaffected; the tint is a pure background-style change drawn on top.
+/// *symbols* identical to the terminal's own blank-cell fill; the tint is a pure
+/// background-style change drawn on top. The change-bar keeps its vivid
+/// `theme.add`/`theme.remove` background (its bg is set explicitly, so the
+/// full-row tint in `apply_row_bg` skips it).
 fn stack_rows(
     model: &DiffModel,
     highlighter: &Highlighter,
@@ -175,6 +243,9 @@ fn stack_rows(
     opts: &RenderOptions,
     width: u16,
 ) -> RenderedDiff {
+    // One column width for the whole render so every line's gutter aligns.
+    let gw = gutter_width(model);
+
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
     for file in &model.files {
@@ -206,8 +277,10 @@ fn stack_rows(
                 )));
             }
 
-            // New-side line counter, seeded from the hunk header. `None` (an
-            // unparseable header) renders blank gutters for the whole hunk.
+            // Old- and new-side line counters, seeded from the hunk header.
+            // `None` (an unparseable header) renders blank gutters for the whole
+            // hunk. Old advances on context+remove, new on context+add.
+            let mut old_line = parse_hunk_old_start(&hunk.header);
             let mut new_line = parse_hunk_new_start(&hunk.header);
 
             // ponytail: a fresh HighlightLines per hunk means highlight state
@@ -217,12 +290,10 @@ fn stack_rows(
             let mut hl = highlighter.line_highlighter(syntax);
 
             for dl in &hunk.lines {
-                // Add/Context advance the new-side counter; Remove does not (it
-                // only exists on the old side), so it gets a blank gutter.
-                let (prefix, mut prefix_style, on_new_side) = match dl.kind {
-                    LineKind::Add => ('+', Style::default().fg(theme.add), true),
-                    LineKind::Remove => ('-', Style::default().fg(theme.remove), false),
-                    LineKind::Context => (' ', Style::default().fg(theme.context), true),
+                let (prefix, mut prefix_style) = match dl.kind {
+                    LineKind::Add => ('+', Style::default().fg(theme.add)),
+                    LineKind::Remove => ('-', Style::default().fg(theme.remove)),
+                    LineKind::Context => (' ', Style::default().fg(theme.context)),
                 };
                 // Moved lines (git `--color-moved`) get the zebra hues — the
                 // moved-in (+) side and moved-out (-) side each get their own
@@ -243,11 +314,29 @@ fn stack_rows(
                 if !collapsed {
                     let (row_bg, emph_bg) = row_tint(dl, theme);
                     let mut spans: Vec<Span<'static>> = Vec::new();
+                    // Far-left change-indicator bar: a 1-col vivid block for
+                    // add/remove, a plain space for context. Its bg is set
+                    // explicitly so the full-row tint (apply_row_bg) skips it and
+                    // it stays drawn even when line numbers are toggled off.
+                    let bar_style = match dl.kind {
+                        LineKind::Add => Style::default().bg(theme.add),
+                        LineKind::Remove => Style::default().bg(theme.remove),
+                        LineKind::Context => Style::default(),
+                    };
+                    spans.push(Span::styled(" ".to_string(), bar_style));
                     if opts.line_numbers {
-                        let gutter = match (on_new_side, new_line) {
-                            (true, Some(n)) => format!("{n:>4} "),
-                            _ => BLANK_GUTTER.to_string(),
+                        // Dual gutter: context shows both numbers, remove the old
+                        // number only, add the new number only.
+                        let (old_disp, new_disp) = match dl.kind {
+                            LineKind::Context => (old_line, new_line),
+                            LineKind::Remove => (old_line, None),
+                            LineKind::Add => (None, new_line),
                         };
+                        let gutter = format!(
+                            "{} {} ",
+                            gutter_cell(old_disp, gw),
+                            gutter_cell(new_disp, gw)
+                        );
                         spans.push(Span::styled(gutter, Style::default().fg(theme.gutter)));
                     }
                     spans.push(Span::styled(prefix.to_string(), prefix_style));
@@ -277,8 +366,15 @@ fn stack_rows(
                     out.push(Line::from(spans));
                 }
 
-                if on_new_side {
-                    new_line = new_line.map(|n| n + 1);
+                // Advance the counters for the side(s) this line exists on, even
+                // when a context line is collapsed (so numbering stays correct).
+                match dl.kind {
+                    LineKind::Context => {
+                        old_line = old_line.map(|n| n + 1);
+                        new_line = new_line.map(|n| n + 1);
+                    }
+                    LineKind::Remove => old_line = old_line.map(|n| n + 1),
+                    LineKind::Add => new_line = new_line.map(|n| n + 1),
                 }
             }
         }
@@ -904,6 +1000,96 @@ diff --git a/x.txt b/x.txt
             text.iter()
                 .any(|l| l.contains("   2 ") && l.contains("new")),
             "expected line 2 gutter on added line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn stack_dual_gutter_and_change_bar() {
+        let model = parse_unified_diff(SAMPLE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let rendered = render_diff(&model, &highlighter, &theme, &RenderOptions::default(), 80);
+
+        let find = |needle: &str| -> Line<'static> {
+            rendered
+                .lines
+                .iter()
+                .find(|l| l.to_string().contains(needle))
+                .unwrap_or_else(|| panic!("no row with {needle:?}"))
+                .clone()
+        };
+
+        // Every diff row leads with a 1-column change-bar span; on add/remove it
+        // carries a vivid background, on context it is a plain unbacked space.
+        let bar = |l: &Line<'static>| l.spans.first().expect("a leading bar span").clone();
+
+        // Context line: bar is a plain space, gutter shows BOTH old and new (1, 1).
+        let context = find("fn main()");
+        let cbar = bar(&context);
+        assert_eq!(cbar.content.as_ref(), " ", "context bar is one column");
+        assert!(cbar.style.bg.is_none(), "context bar carries no background");
+        let ctx_text = context.to_string();
+        // gutter width is 3 here, so "  1   1 " precedes the prefix+content.
+        assert!(
+            ctx_text.contains("  1   1 "),
+            "context should show both line numbers: {ctx_text:?}"
+        );
+
+        // Removed line: bar uses the vivid remove color; gutter shows the old
+        // number and a BLANK new column.
+        let removed = find(r#"println!("old")"#);
+        assert_eq!(
+            bar(&removed).style.bg,
+            Some(theme.remove),
+            "remove bar should use the vivid remove background"
+        );
+        // old = 2, new blank: "  2     -" (3-wide old, space, 3 blanks, space).
+        assert!(
+            removed.to_string().contains("  2     -"),
+            "removed row should show old# only, blank new#: {:?}",
+            removed.to_string()
+        );
+
+        // Added line: bar uses the vivid add color; gutter shows a BLANK old
+        // column and the new number.
+        let added = find("// added line");
+        assert_eq!(
+            bar(&added).style.bg,
+            Some(theme.add),
+            "add bar should use the vivid add background"
+        );
+        // old blank, new = 3: "      3 +" (3 blanks, space, "  3", space).
+        assert!(
+            added.to_string().contains("      3 +"),
+            "added row should show new# only, blank old#: {:?}",
+            added.to_string()
+        );
+    }
+
+    #[test]
+    fn stack_change_bar_kept_when_line_numbers_off() {
+        let model = parse_unified_diff(SAMPLE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let opts = RenderOptions {
+            line_numbers: false,
+            ..RenderOptions::default()
+        };
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, 80);
+
+        let added = rendered
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("// added line"))
+            .expect("added line present");
+        // First span is still the 1-col change-bar (vivid add bg)...
+        assert_eq!(added.spans[0].content.as_ref(), " ");
+        assert_eq!(added.spans[0].style.bg, Some(theme.add));
+        // ...and with numbers off, the prefix follows immediately (no digits).
+        assert!(
+            added.to_string().starts_with(" +"),
+            "numbers-off row is bar + prefix: {:?}",
+            added.to_string()
         );
     }
 
