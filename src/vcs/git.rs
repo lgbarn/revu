@@ -3,26 +3,43 @@ use std::process::{Command, Output};
 
 use anyhow::{anyhow, Context, Result};
 
-use super::VcsAdapter;
+use super::{DiffOptions, VcsAdapter};
 
 /// Talks to git by shelling out via argument vectors. There is no shell
 /// interpolation anywhere: every argument is passed as a discrete vector
 /// element, so no input can be interpreted as a shell command.
 pub struct GitAdapter {
     program: String,
+    /// Working directory to run git in. `None` uses the process CWD; tests set
+    /// it to a fixture repo via [`GitAdapter::in_dir`].
+    cwd: Option<PathBuf>,
 }
 
 impl GitAdapter {
     pub fn new() -> Self {
         Self {
             program: "git".to_string(),
+            cwd: None,
+        }
+    }
+
+    /// Like [`GitAdapter::new`], but runs git inside `dir` rather than the
+    /// process working directory. Primarily for testing against fixture repos.
+    #[cfg(test)]
+    pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            program: "git".to_string(),
+            cwd: Some(dir.into()),
         }
     }
 
     fn run(&self, args: &[&str]) -> Result<Output> {
-        Command::new(&self.program)
-            .args(args)
-            .output()
+        let mut cmd = Command::new(&self.program);
+        cmd.args(args);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.output()
             .with_context(|| format!("failed to execute `{}` (is git installed?)", self.program))
     }
 }
@@ -48,14 +65,248 @@ impl VcsAdapter for GitAdapter {
         Ok(PathBuf::from(root))
     }
 
-    fn working_tree_diff(&self) -> Result<String> {
+    fn diff(&self, opts: &DiffOptions) -> Result<String> {
         // `-c color.ui=never` forces plain output regardless of the user's git
         // config, so our own parser/renderer sees clean diff text.
-        let out = self.run(&["-c", "color.ui=never", "diff"])?;
+        let mut args: Vec<String> = vec!["-c".into(), "color.ui=never".into(), "diff".into()];
+        if opts.staged {
+            args.push("--staged".into());
+        }
+        if !opts.paths.is_empty() {
+            args.push("--".into());
+            args.extend(opts.paths.iter().cloned());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&arg_refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git diff failed: {}", stderr.trim()));
         }
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        // Untracked files never appear in `git diff`; synthesize a diff for each
+        // by comparing against /dev/null. Staged-only reviews skip this.
+        if opts.include_untracked && !opts.staged {
+            for path in self.untracked_files(&opts.paths)? {
+                text.push_str(&self.no_index_diff("/dev/null", &path)?);
+            }
+        }
+        Ok(text)
+    }
+
+    fn diff_files(&self, left: &str, right: &str) -> Result<String> {
+        self.no_index_diff(left, right)
+    }
+}
+
+impl GitAdapter {
+    /// List untracked, non-ignored files, optionally scoped by `paths`. Uses
+    /// `-z` (NUL-separated) so paths with spaces/newlines survive intact.
+    fn untracked_files(&self, paths: &[String]) -> Result<Vec<String>> {
+        let mut args: Vec<String> = vec![
+            "ls-files".into(),
+            "--others".into(),
+            "--exclude-standard".into(),
+            "-z".into(),
+        ];
+        if !paths.is_empty() {
+            args.push("--".into());
+            args.extend(paths.iter().cloned());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&arg_refs)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("git ls-files failed: {}", stderr.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Diff two paths with `--no-index`. git exits 1 (not 0) when the files
+    /// differ, which is the normal, expected case here, so only a status > 1 or
+    /// a spawn failure is treated as an error.
+    fn no_index_diff(&self, left: &str, right: &str) -> Result<String> {
+        let out = self.run(&[
+            "-c",
+            "color.ui=never",
+            "diff",
+            "--no-index",
+            "--",
+            left,
+            right,
+        ])?;
+        let code = out.status.code();
+        if !out.status.success() && code != Some(1) {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("git diff --no-index failed: {}", stderr.trim()));
+        }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+// These tests shell out to real git and synthesize untracked diffs against
+// `/dev/null`, so they only run on unix.
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    /// Run a git command in `dir`, asserting it succeeds (fixture setup).
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("failed to spawn git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A repo with: a committed file modified but unstaged, a new staged file,
+    /// and an untracked file.
+    fn fixture_repo() -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+
+        fs::write(p.join("committed.txt"), "original\n").unwrap();
+        git(p, &["add", "committed.txt"]);
+        git(p, &["commit", "-q", "-m", "initial"]);
+
+        // Unstaged modification to the committed file.
+        fs::write(p.join("committed.txt"), "original\nUNSTAGED_LINE\n").unwrap();
+
+        // A brand-new file added to the index (staged-only).
+        fs::write(p.join("staged.txt"), "STAGED_LINE\n").unwrap();
+        git(p, &["add", "staged.txt"]);
+
+        // An untracked file (never added).
+        fs::write(p.join("untracked.txt"), "UNTRACKED_LINE\n").unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn diff_default_includes_unstaged_and_untracked() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec![],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(
+            out.contains("committed.txt"),
+            "missing committed.txt: {out}"
+        );
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing unstaged change: {out}"
+        );
+        assert!(
+            out.contains("untracked.txt"),
+            "missing untracked file: {out}"
+        );
+        assert!(
+            out.contains("UNTRACKED_LINE"),
+            "missing untracked content: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_staged_shows_staged_not_unstaged() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: true,
+                paths: vec![],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(out.contains("staged.txt"), "missing staged file: {out}");
+        assert!(out.contains("STAGED_LINE"), "missing staged content: {out}");
+        // Unstaged-only change and untracked files must not leak into --staged.
+        assert!(
+            !out.contains("UNSTAGED_LINE"),
+            "staged diff leaked unstaged: {out}"
+        );
+        assert!(
+            !out.contains("UNTRACKED_LINE"),
+            "staged diff leaked untracked: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_exclude_untracked_omits_untracked() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec![],
+                include_untracked: false,
+            })
+            .unwrap();
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing unstaged change: {out}"
+        );
+        assert!(
+            !out.contains("untracked.txt"),
+            "untracked not excluded: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_paths_scopes_to_pathspec() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec!["committed.txt".to_string()],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(out.contains("committed.txt"), "missing scoped file: {out}");
+        assert!(
+            out.contains("UNSTAGED_LINE"),
+            "missing scoped change: {out}"
+        );
+        // The untracked file is outside the pathspec, so it must be excluded.
+        assert!(
+            !out.contains("untracked.txt"),
+            "pathspec did not scope: {out}"
+        );
+    }
+
+    #[test]
+    fn diff_files_compares_arbitrary_files() {
+        let dir = tempdir().expect("tempdir");
+        let left = dir.path().join("left.txt");
+        let right = dir.path().join("right.txt");
+        fs::write(&left, "hello\n").unwrap();
+        fs::write(&right, "world\n").unwrap();
+
+        // No repo here; diff_files must not require one.
+        let adapter = GitAdapter::new();
+        let out = adapter
+            .diff_files(left.to_str().unwrap(), right.to_str().unwrap())
+            .unwrap();
+        assert!(out.contains("-hello"), "missing removed line: {out}");
+        assert!(out.contains("+world"), "missing added line: {out}");
     }
 }

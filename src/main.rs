@@ -21,7 +21,11 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Diff => app::run_diff(),
+        Command::Diff {
+            staged,
+            exclude_untracked,
+            targets,
+        } => app::run_diff(staged, exclude_untracked, targets),
         Command::Pager => pager::run_pager(),
         Command::Patch { file } => pager::run_patch(file),
     }
