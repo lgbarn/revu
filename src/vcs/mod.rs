@@ -35,4 +35,11 @@ pub trait VcsAdapter {
     /// The unified diff between two arbitrary files, which need not be inside a
     /// repository.
     fn diff_files(&self, left: &str, right: &str) -> Result<String>;
+
+    /// The colored diff for a single revision (e.g. `HEAD`, a commit SHA), as
+    /// the VCS would print it for `show`.
+    fn revision_show(&self, reff: &str) -> Result<String>;
+
+    /// The colored diff for a stash entry (e.g. `stash@{0}`).
+    fn stash_show(&self, reff: &str) -> Result<String>;
 }

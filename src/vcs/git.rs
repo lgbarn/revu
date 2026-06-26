@@ -105,6 +105,39 @@ impl VcsAdapter for GitAdapter {
     fn diff_files(&self, left: &str, right: &str) -> Result<String> {
         self.no_index_diff(left, right)
     }
+
+    fn revision_show(&self, reff: &str) -> Result<String> {
+        // `-c color.ui=always` + `--color-moved=zebra` mirror `diff` so the
+        // ANSI-aware parser and move detection apply identically. git prints
+        // commit metadata before the diff; the parser ignores non-hunk header
+        // lines, so only the diff renders.
+        //
+        // ponytail: commit metadata (author/message) is not displayed in v1.
+        // Surfacing it (e.g. as a synthetic header pane) is a later enhancement.
+        let out = self.run(&["-c", "color.ui=always", "show", "--color-moved=zebra", reff])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("git show failed: {}", stderr.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn stash_show(&self, reff: &str) -> Result<String> {
+        let out = self.run(&[
+            "-c",
+            "color.ui=always",
+            "stash",
+            "show",
+            "-p",
+            "--color-moved=zebra",
+            reff,
+        ])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("git stash show failed: {}", stderr.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 impl GitAdapter {
@@ -369,5 +402,63 @@ mod tests {
             .unwrap();
         assert!(out.contains("-hello"), "missing removed line: {out}");
         assert!(out.contains("+world"), "missing added line: {out}");
+    }
+
+    #[test]
+    fn revision_show_renders_head_commit() {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+
+        fs::write(p.join("shown.txt"), "SHOWN_LINE\n").unwrap();
+        git(p, &["add", "shown.txt"]);
+        git(p, &["commit", "-q", "-m", "add shown"]);
+
+        let adapter = GitAdapter::in_dir(p);
+        let out = adapter.revision_show("HEAD").unwrap();
+        assert!(out.contains("shown.txt"), "missing committed file: {out}");
+        assert!(out.contains("SHOWN_LINE"), "missing added line: {out}");
+    }
+
+    #[test]
+    fn revision_show_bad_ref_errors() {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        fs::write(p.join("f.txt"), "x\n").unwrap();
+        git(p, &["add", "f.txt"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+
+        let adapter = GitAdapter::in_dir(p);
+        assert!(adapter.revision_show("does-not-exist-ref").is_err());
+    }
+
+    #[test]
+    fn stash_show_renders_latest_entry() {
+        let dir = tempdir().expect("tempdir");
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "test@example.com"]);
+        git(p, &["config", "user.name", "Test"]);
+
+        fs::write(p.join("stashed.txt"), "original\n").unwrap();
+        git(p, &["add", "stashed.txt"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+
+        // Modify the tracked file, then stash the change.
+        fs::write(p.join("stashed.txt"), "original\nSTASHED_LINE\n").unwrap();
+        git(p, &["stash", "-q"]);
+
+        let adapter = GitAdapter::in_dir(p);
+        let out = adapter.stash_show("stash@{0}").unwrap();
+        assert!(out.contains("stashed.txt"), "missing stashed file: {out}");
+        assert!(
+            out.contains("STASHED_LINE"),
+            "missing stashed change: {out}"
+        );
     }
 }

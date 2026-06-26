@@ -11,7 +11,7 @@ mod worddiff;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, StashCmd};
 use config::ConfigOverrides;
 
 fn main() {
@@ -48,6 +48,10 @@ fn run() -> anyhow::Result<()> {
             };
             app::run_diff(staged, exclude_untracked, targets, overrides)
         }
+        Command::Show { reff } => app::run_show(reff, ConfigOverrides::default()),
+        Command::Stash {
+            cmd: StashCmd::Show { reff },
+        } => app::run_stash_show(reff, ConfigOverrides::default()),
         Command::Pager => pager::run_pager(),
         Command::Patch { file } => pager::run_patch(file),
     }
