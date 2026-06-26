@@ -1,6 +1,7 @@
 //! Terminal setup and the interactive review loop shared by `diff`, `pager`,
 //! and `patch` (via [`review_text`]).
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -15,6 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff_colored, DiffModel};
+use crate::fold::{fold_at_cursor, FoldId};
 use crate::highlight::Highlighter;
 use crate::render::{
     file_at_offset, file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions,
@@ -249,6 +251,12 @@ fn run_loop(
     // split column width, or a display toggle changes.
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::new();
+    // Row -> FoldId for the fold bars in the current render, ascending by row.
+    // Rebuilt every render alongside `lines`; the `o`/Enter toggle reads it.
+    let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
+    // The folds the user has expanded. Empty = every fold collapsed (the default
+    // view). A render toggle (like the display toggles) re-renders when it changes.
+    let mut expanded_folds: HashSet<FoldId> = HashSet::new();
     let summaries = file_summaries(model);
     let mut offset: u16 = 0;
     let mut show_help = false;
@@ -277,9 +285,17 @@ fn run_loop(
             || (eff_mode == LayoutMode::Split && main_width != cur_width)
         {
             opts.mode = eff_mode;
-            let r = render_diff(model, &highlighter, &theme, &opts, main_width);
+            let r = render_diff(
+                model,
+                &highlighter,
+                &theme,
+                &opts,
+                &expanded_folds,
+                main_width,
+            );
             lines = r.lines;
             file_starts = r.file_starts;
+            fold_bars = r.fold_bars;
             cur_mode = Some(eff_mode);
             cur_width = main_width;
             needs_render = false;
@@ -396,6 +412,28 @@ fn run_loop(
                 }
                 KeyCode::Char('c') => {
                     opts.context_collapsed = !opts.context_collapsed;
+                    needs_render = true;
+                }
+                // Folds: toggle the fold nearest the viewport top (`o`/Enter),
+                // expand all (`O`), or collapse all (`C`). `fold_bars` lists every
+                // fold's bar row, so expand-all just inserts them all.
+                KeyCode::Char('o') | KeyCode::Enter => {
+                    if let Some(id) = fold_at_cursor(&fold_bars, offset as usize) {
+                        // insert() returns false when already expanded -> collapse it.
+                        if !expanded_folds.insert(id) {
+                            expanded_folds.remove(&id);
+                        }
+                        needs_render = true;
+                    }
+                }
+                KeyCode::Char('O') => {
+                    for &(_, id) in &fold_bars {
+                        expanded_folds.insert(id);
+                    }
+                    needs_render = true;
+                }
+                KeyCode::Char('C') => {
+                    expanded_folds.clear();
                     needs_render = true;
                 }
                 // Cycle the layout mode auto -> split -> stack -> auto. The next
@@ -700,7 +738,9 @@ fn status_bar(
     } else {
         selected_file + 1
     };
-    let text = format!(" file {pos}/{file_count}  {pct}%  [{toggles}]  s sidebar  e edit  ? help ");
+    let text = format!(
+        " file {pos}/{file_count}  {pct}%  [{toggles}]  o fold  s sidebar  e edit  ? help "
+    );
     Paragraph::new(text).style(
         Style::default()
             .fg(theme.status_fg)
@@ -731,6 +771,9 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  w   toggle line wrap",
         "  H   toggle hunk headers",
         "  c   toggle context collapse",
+        "  o / Enter   toggle fold",
+        "  O   expand all folds",
+        "  C   collapse all folds",
         "  m   cycle layout auto/split/stack",
         "  t   theme selector",
         "",
@@ -884,7 +927,7 @@ index 5555555..6666666 100644
         let theme = Theme::default();
         let catalog = crate::theme::catalog();
         let opts = RenderOptions::default();
-        let rendered = render_diff(&model, &highlighter, &theme, &opts, 80);
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 80);
         let summaries = file_summaries(&model);
 
         // Select the second file and scroll the main view to its start.
@@ -968,7 +1011,14 @@ index 5555555..6666666 100644
             mode,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &theme, &opts, main_width);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &theme,
+            &opts,
+            &HashSet::new(),
+            main_width,
+        );
         let summaries = file_summaries(&model);
         let view = ReviewFrame {
             lines: &rendered.lines,

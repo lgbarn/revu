@@ -3,10 +3,13 @@
 //! This is a pure function over the model, so the same output that the live UI
 //! draws can be snapshot-tested against an in-memory buffer.
 
+use std::collections::HashSet;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::diff::{DiffLine, DiffModel, LineKind};
+use crate::fold::{compute_hunk_folds, is_expanded, FoldId};
 use crate::highlight::Highlighter;
 use crate::theme::Theme;
 
@@ -61,10 +64,15 @@ const BLANK_GUTTER: &str = "     ";
 /// The rendered diff plus the per-file line offsets that let the UI scroll the
 /// main view to a chosen file. `file_starts[i]` is the index in `lines` of the
 /// first rendered line of `model.files[i]` (its header row).
+///
+/// `fold_bars` maps the rendered ROW index of each fold bar (collapsed `▼` or
+/// expanded `▲`) to its [`FoldId`], ascending by row, so the app can find the
+/// fold nearest the viewport to toggle. Only the stack layout produces folds.
 #[derive(Debug, Clone)]
 pub struct RenderedDiff {
     pub lines: Vec<Line<'static>>,
     pub file_starts: Vec<usize>,
+    pub fold_bars: Vec<(usize, FoldId)>,
 }
 
 /// One row of the file sidebar: a path with its add/remove line counts.
@@ -122,7 +130,8 @@ pub fn render_lines(
     opts: &RenderOptions,
     width: u16,
 ) -> Vec<Line<'static>> {
-    render_diff(model, highlighter, theme, opts, width).lines
+    // No expanded folds: all foldable runs collapse (the default view).
+    render_diff(model, highlighter, theme, opts, &HashSet::new(), width).lines
 }
 
 /// Render the model, also recording where each file begins so the UI can jump
@@ -137,9 +146,10 @@ pub fn render_diff(
     highlighter: &Highlighter,
     theme: &Theme,
     opts: &RenderOptions,
+    folds: &HashSet<FoldId>,
     width: u16,
 ) -> RenderedDiff {
-    layout_rows(model, highlighter, theme, opts, width)
+    layout_rows(model, highlighter, theme, opts, folds, width)
 }
 
 /// Pure row generation over `(model, opts, width)`: the single entry point the
@@ -150,16 +160,21 @@ fn layout_rows(
     highlighter: &Highlighter,
     theme: &Theme,
     opts: &RenderOptions,
+    folds: &HashSet<FoldId>,
     width: u16,
 ) -> RenderedDiff {
     if model.files.is_empty() {
         return RenderedDiff {
             lines: vec![Line::from("No changes in the working tree.")],
             file_starts: Vec::new(),
+            fold_bars: Vec::new(),
         };
     }
     match opts.mode {
-        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, width),
+        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, folds, width),
+        // ponytail: the split layout renders every line uncollapsed (no folds).
+        // Folds target the stack view, which is the default; split is opt-in /
+        // wide-terminal only. Folding split's paired change-groups is a later add.
         LayoutMode::Split => split_rows(model, highlighter, theme, opts, width),
     }
 }
@@ -241,6 +256,7 @@ fn stack_rows(
     highlighter: &Highlighter,
     theme: &Theme,
     opts: &RenderOptions,
+    folds: &HashSet<FoldId>,
     width: u16,
 ) -> RenderedDiff {
     // One column width for the whole render so every line's gutter aligns.
@@ -248,9 +264,14 @@ fn stack_rows(
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
-    for file in &model.files {
+    // Row -> FoldId for every emitted fold bar, ascending by row (we append top
+    // to bottom). The app uses this to find the fold nearest the viewport.
+    let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
+    for (file_idx, file) in model.files.iter().enumerate() {
         // Record the first rendered line index for this file before emitting it.
         file_starts.push(out.len());
+        // Folds are numbered per file, sequentially across its hunks.
+        let mut fold_index = 0usize;
         out.push(Line::from(Span::styled(
             format!("── {} ", file.path),
             Style::default()
@@ -283,13 +304,39 @@ fn stack_rows(
             let mut old_line = parse_hunk_old_start(&hunk.header);
             let mut new_line = parse_hunk_new_start(&hunk.header);
 
+            // Compute this hunk's folds and project them onto per-line arrays:
+            // `bar_fold[i]` is the fold whose bar prints just before line `i`;
+            // `hidden[i]` is true when line `i` is collapsed away by its fold.
+            // `context_collapsed` (the all-context toggle) supersedes folds — with
+            // every context line already hidden there is nothing to fold around.
+            let n = hunk.lines.len();
+            // `(FoldId, hidden-count)` of the fold whose bar prints before line i.
+            let mut bar_fold: Vec<Option<(FoldId, usize)>> = vec![None; n];
+            let mut hidden: Vec<bool> = vec![false; n];
+            if !opts.context_collapsed {
+                for f in compute_hunk_folds(&hunk.lines, file_idx, &mut fold_index) {
+                    bar_fold[f.start] = Some((f.id, f.hidden()));
+                    if !is_expanded(folds, f.id) {
+                        hidden[f.start..f.end].fill(true);
+                    }
+                }
+            }
+
             // ponytail: a fresh HighlightLines per hunk means highlight state
             // (open strings/comments spanning hunk boundaries) resets at each
             // `@@`. Acceptable for diff review — hunks are non-contiguous slices
             // of the file anyway. Whole-file state would need the full source.
             let mut hl = highlighter.line_highlighter(syntax);
 
-            for dl in &hunk.lines {
+            for (i, dl) in hunk.lines.iter().enumerate() {
+                // A fold bar prints just above its first line: `▼` collapsed (the
+                // hidden lines follow it suppressed) or `▲` expanded (the lines
+                // follow it visible, so re-collapsing has a target row).
+                if let Some((id, count)) = bar_fold[i] {
+                    let expanded = is_expanded(folds, id);
+                    fold_bars.push((out.len(), id));
+                    out.push(fold_bar_line(count, expanded, theme));
+                }
                 let (prefix, mut prefix_style) = match dl.kind {
                     LineKind::Add => ('+', Style::default().fg(theme.add)),
                     LineKind::Remove => ('-', Style::default().fg(theme.remove)),
@@ -310,7 +357,11 @@ fn stack_rows(
                 // correct even when a context line is collapsed (not rendered).
                 let highlighted = highlighter.highlight_line(&mut hl, &dl.content);
 
-                let collapsed = opts.context_collapsed && dl.kind == LineKind::Context;
+                // Suppress a line when the all-context toggle hides it OR when it
+                // falls inside a collapsed fold's hidden range. Either way the
+                // counters still advance below, so numbering jumps the hidden run.
+                let collapsed =
+                    (opts.context_collapsed && dl.kind == LineKind::Context) || hidden[i];
                 if !collapsed {
                     let (row_bg, emph_bg) = row_tint(dl, theme);
                     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -384,7 +435,22 @@ fn stack_rows(
     RenderedDiff {
         lines: out,
         file_starts,
+        fold_bars,
     }
+}
+
+/// One collapsible fold bar: `▼ N unchanged lines` when collapsed, `▲ N
+/// unchanged lines` when expanded (the expanded header gives re-collapse a row
+/// to target). Drawn dim in the gutter color so it reads as chrome, not content.
+fn fold_bar_line(hidden: usize, expanded: bool, theme: &Theme) -> Line<'static> {
+    let arrow = if expanded { '▲' } else { '▼' };
+    let text = format!("  {arrow} {hidden} unchanged lines");
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(theme.gutter)
+            .add_modifier(Modifier::DIM),
+    ))
 }
 
 /// Column separator between the old (left) and new (right) panes in split view.
@@ -523,6 +589,8 @@ fn split_rows(
     RenderedDiff {
         lines: out,
         file_starts,
+        // Split renders every line uncollapsed, so it emits no fold bars.
+        fold_bars: Vec::new(),
     }
 }
 
@@ -791,6 +859,8 @@ fn styled_segment(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::diff::parse_unified_diff;
     use ratatui::backend::TestBackend;
@@ -1008,7 +1078,14 @@ diff --git a/x.txt b/x.txt
         let model = parse_unified_diff(SAMPLE);
         let highlighter = Highlighter::new();
         let theme = Theme::default();
-        let rendered = render_diff(&model, &highlighter, &theme, &RenderOptions::default(), 80);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &theme,
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
 
         let find = |needle: &str| -> Line<'static> {
             rendered
@@ -1075,7 +1152,7 @@ diff --git a/x.txt b/x.txt
             line_numbers: false,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &theme, &opts, 80);
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 80);
 
         let added = rendered
             .lines
@@ -1143,6 +1220,7 @@ index 3333333..4444444 100644
             &highlighter,
             &Theme::default(),
             &RenderOptions::default(),
+            &HashSet::new(),
             80,
         );
 
@@ -1164,7 +1242,14 @@ index 3333333..4444444 100644
         let highlighter = Highlighter::new();
         let opts = RenderOptions::default();
         let plain = render_lines(&model, &highlighter, &Theme::default(), &opts, 80);
-        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, 80);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            80,
+        );
         assert_eq!(plain.len(), rendered.lines.len());
     }
 
@@ -1233,7 +1318,14 @@ index 3333333..4444444 100644
             mode: LayoutMode::Split,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, width);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            width,
+        );
         let col_w = ((width - SEP) / 2) as usize;
 
         // Every composed paired row contains exactly one separator, and the left
@@ -1291,6 +1383,7 @@ index 3333333..4444444 100644
             &highlighter,
             &Theme::default(),
             &RenderOptions::default(),
+            &HashSet::new(),
             80,
         );
         let split = render_diff(
@@ -1301,6 +1394,7 @@ index 3333333..4444444 100644
                 mode: LayoutMode::Split,
                 ..RenderOptions::default()
             },
+            &HashSet::new(),
             80,
         );
         // Stack never emits the column separator; split does.
@@ -1336,7 +1430,14 @@ diff --git a/x.txt b/x.txt
             mode: LayoutMode::Split,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, width);
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            width,
+        );
         let col_w = ((width - SEP) / 2) as usize;
 
         let row_with = |needle: &str| -> String {
@@ -1389,7 +1490,14 @@ diff --git a/u.txt b/u.txt
         };
         // Widths from pathological (0/1/2) up to comfortable must all render.
         for w in [0u16, 1, 2, 3, 10, 40] {
-            let rendered = render_diff(&model, &highlighter, &Theme::default(), &opts, w);
+            let rendered = render_diff(
+                &model,
+                &highlighter,
+                &Theme::default(),
+                &opts,
+                &HashSet::new(),
+                w,
+            );
             assert!(!rendered.lines.is_empty(), "width {w} produced no rows");
         }
     }
@@ -1408,6 +1516,220 @@ diff --git a/u.txt b/u.txt
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| f.render_widget(Paragraph::new(lines.clone()), f.area()))
+            .unwrap();
+
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    // A 20-line file with one change in the middle, rendered with FULL context
+    // (as `git diff --unified=100000` produces). Lines 1-9 precede the change,
+    // lines 11-20 follow it. With FOLD_MARGIN=3 this yields two folds: a leading
+    // fold hiding "line 1".."line 6" (6 lines, keeping 7/8/9) and a trailing fold
+    // hiding "line 14".."line 20" (7 lines, keeping 11/12/13).
+    const FOLD_SAMPLE: &str = "\
+diff --git a/file.txt b/file.txt
+index 1111111..2222222 100644
+--- a/file.txt
++++ b/file.txt
+@@ -1,20 +1,20 @@
+ line 1
+ line 2
+ line 3
+ line 4
+ line 5
+ line 6
+ line 7
+ line 8
+ line 9
+-line 10 old
++line 10 new
+ line 11
+ line 12
+ line 13
+ line 14
+ line 15
+ line 16
+ line 17
+ line 18
+ line 19
+ line 20
+";
+
+    #[test]
+    fn collapsed_folds_show_bars_with_counts_and_margins() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        // Default = no expanded folds = everything collapsed.
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
+        let text: Vec<String> = rendered.lines.iter().map(|l| l.to_string()).collect();
+
+        // Both fold bars appear with their exact hidden counts.
+        assert!(
+            text.iter().any(|l| l.contains("▼ 6 unchanged lines")),
+            "leading fold bar (6 lines) missing: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("▼ 7 unchanged lines")),
+            "trailing fold bar (7 lines) missing: {text:?}"
+        );
+        // Kept margins (3 lines either side of the change) stay visible...
+        for kept in [
+            "line 7", "line 8", "line 9", "line 11", "line 12", "line 13",
+        ] {
+            assert!(
+                text.iter().any(|l| l.contains(kept)),
+                "margin line {kept:?} should stay visible: {text:?}"
+            );
+        }
+        // ...and the hidden lines do NOT render (keeping the output small).
+        // `ends_with` so "line 1" does not match the visible "line 10".."line 13".
+        for gone in ["line 1", "line 5", "line 6", "line 14", "line 20"] {
+            assert!(
+                !text.iter().any(|l| l.ends_with(gone)),
+                "hidden line {gone:?} leaked into the render: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gutter_numbers_jump_across_a_collapsed_fold() {
+        // The leading fold hides lines 1-6; the first visible content row is
+        // "line 7", so its dual gutter must read old=7 new=7 (the counters
+        // advanced through the six hidden lines).
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
+        let row7 = rendered
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|s| s.contains("line 7"))
+            .expect("line 7 row present");
+        // gutter width is 3 here: "  7   7 " (old, space, new, space) before content.
+        assert!(
+            row7.contains("  7   7 "),
+            "line 7 should carry old=7 new=7 after the fold: {row7:?}"
+        );
+    }
+
+    #[test]
+    fn fold_bars_map_rows_to_fold_ids() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
+        // Two folds -> two bars, ascending by row, each row IS a fold bar line.
+        assert_eq!(rendered.fold_bars.len(), 2);
+        assert!(rendered.fold_bars[0].0 < rendered.fold_bars[1].0);
+        for &(row, _id) in &rendered.fold_bars {
+            assert!(
+                rendered.lines[row].to_string().contains("unchanged lines"),
+                "fold_bars row {row} is not a fold bar"
+            );
+        }
+        // The two folds are file 0's index 0 and 1.
+        assert_eq!(rendered.fold_bars[0].1, FoldId { file: 0, index: 0 });
+        assert_eq!(rendered.fold_bars[1].1, FoldId { file: 0, index: 1 });
+    }
+
+    #[test]
+    fn expanding_a_fold_reveals_its_hidden_lines() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        // Expand the leading fold (file 0, index 0).
+        let mut expanded = HashSet::new();
+        expanded.insert(FoldId { file: 0, index: 0 });
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &expanded,
+            80,
+        );
+        let text: Vec<String> = rendered.lines.iter().map(|l| l.to_string()).collect();
+        // The expanded fold now shows a `▲` header and reveals its hidden lines.
+        assert!(
+            text.iter().any(|l| l.contains("▲ 6 unchanged lines")),
+            "expanded fold should show the ▲ header: {text:?}"
+        );
+        assert!(
+            // `ends_with` distinguishes "line 1" from "line 10".."line 19".
+            text.iter().any(|l| l.ends_with("line 1")),
+            "expanded fold should reveal line 1: {text:?}"
+        );
+        // The OTHER (trailing) fold is still collapsed.
+        assert!(
+            text.iter().any(|l| l.contains("▼ 7 unchanged lines")),
+            "trailing fold should remain collapsed: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("line 20")),
+            "trailing fold's hidden lines must stay hidden: {text:?}"
+        );
+    }
+
+    #[test]
+    fn renders_collapsed_fold_to_buffer() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            50,
+        );
+
+        let backend = TestBackend::new(50, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(rendered.lines.clone()), f.area()))
+            .unwrap();
+
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn renders_expanded_fold_to_buffer() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        let mut expanded = HashSet::new();
+        expanded.insert(FoldId { file: 0, index: 0 });
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &expanded,
+            50,
+        );
+
+        let backend = TestBackend::new(50, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(rendered.lines.clone()), f.area()))
             .unwrap();
 
         insta::assert_snapshot!(terminal.backend());
