@@ -1,4 +1,5 @@
-//! Terminal setup and the interactive event loop for `revu diff`.
+//! Terminal setup and the interactive review loop shared by `diff`, `pager`,
+//! and `patch` (via [`review_text`]).
 
 #[cfg(unix)]
 use std::io::IsTerminal;
