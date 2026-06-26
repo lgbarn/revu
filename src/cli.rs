@@ -47,7 +47,7 @@ pub enum Command {
         #[arg(long = "no-hunk-headers", overrides_with = "hunk_headers")]
         no_hunk_headers: bool,
 
-        /// Color theme name (parsed/carried; applied in a later milestone)
+        /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
         #[arg(long)]
         theme: Option<String>,
         /// Layout mode (parsed/carried; applied in a later milestone)

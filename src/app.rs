@@ -18,6 +18,7 @@ use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::highlight::Highlighter;
 use crate::render::{file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions};
 use crate::state::ViewState;
+use crate::theme::{self, resolve_theme, Theme};
 use crate::vcs::git::GitAdapter;
 use crate::vcs::{DiffOptions, VcsAdapter};
 use crate::worddiff::compute_word_emphasis;
@@ -107,14 +108,20 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
     let mut model = parse_unified_diff_colored(diff_text);
     // Fill intra-line word-level emphasis on modified lines before rendering.
     compute_word_emphasis(&mut model);
-    // One highlighter for the whole review: building the syntax/theme sets is
-    // expensive, so it is created once here (the shared render path).
-    let highlighter = Highlighter::new();
 
     // Resolve config first (this can fail cleanly on malformed TOML, before the
     // terminal is touched). It seeds the initial toggles; a saved state.json
     // then overrides them if one exists (last-session-wins precedence).
     let config = Config::load(overrides)?;
+
+    // Resolve the active theme from config + the detected terminal background.
+    // This too fails cleanly (unknown theme name, invalid custom-theme hex)
+    // before the terminal is touched. The highlighter is then built on the
+    // theme's bundled syntect theme; rebuilding the syntax/theme sets is
+    // expensive, so it is created once here and swapped only on a live theme
+    // change.
+    let theme = resolve_theme(&config, theme::terminal_is_dark())?;
+    let highlighter = Highlighter::with_theme(&theme.syntect_theme, &theme.syntax_overrides);
     let mut opts = RenderOptions {
         line_numbers: config.line_numbers,
         hunk_headers: config.hunk_headers,
@@ -143,7 +150,15 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
     // `ratatui::init` installs a panic hook that restores the terminal, so a
     // crash mid-render won't leave the user in a broken alternate screen.
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, &model, &highlighter, opts, wrap, config.mode);
+    let result = run_loop(
+        &mut terminal,
+        &model,
+        highlighter,
+        theme,
+        opts,
+        wrap,
+        config.mode,
+    );
     ratatui::restore();
     result
 }
@@ -212,12 +227,21 @@ fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
 fn run_loop(
     terminal: &mut DefaultTerminal,
     model: &DiffModel,
-    highlighter: &Highlighter,
+    mut highlighter: Highlighter,
+    mut theme: Theme,
     mut opts: RenderOptions,
     mut wrap: bool,
     mut mode: String,
 ) -> Result<()> {
     let file_count = model.files.len();
+    // The curated catalog the theme selector cycles through. The active theme's
+    // index seeds the selector cursor (or 0 when a custom theme isn't in it).
+    let catalog = theme::catalog();
+    let mut show_theme_selector = false;
+    let mut theme_cursor = catalog
+        .iter()
+        .position(|t| t.name == theme.name)
+        .unwrap_or(0);
     // Rendered lines are (re)built lazily inside the loop: the first iteration
     // always renders, and thereafter only when the effective layout mode, the
     // split column width, or a display toggle changes.
@@ -249,7 +273,7 @@ fn run_loop(
             || (eff_mode == LayoutMode::Split && main_width != cur_width)
         {
             opts.mode = eff_mode;
-            let r = render_diff(model, highlighter, &opts, main_width);
+            let r = render_diff(model, &highlighter, &theme, &opts, main_width);
             lines = r.lines;
             file_starts = r.file_starts;
             cur_mode = Some(eff_mode);
@@ -264,6 +288,7 @@ fn run_loop(
             lines: &lines,
             summaries: &summaries,
             opts: &opts,
+            theme: &theme,
             file_count,
             selected_file,
             offset,
@@ -271,6 +296,9 @@ fn run_loop(
             wrap,
             sidebar_visible,
             show_help,
+            show_theme_selector,
+            catalog: &catalog,
+            theme_cursor,
         };
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
@@ -284,6 +312,32 @@ fn run_loop(
         }
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // When the theme selector is open it captures navigation/confirm keys
+            // so they don't also scroll the diff. Enter applies the highlighted
+            // theme live (swap the palette + rebuild the highlighter on its
+            // syntect theme, then re-render); Esc/`t` cancel.
+            if show_theme_selector {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('q') => {
+                        show_theme_selector = false;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        theme_cursor = (theme_cursor + 1).min(catalog.len().saturating_sub(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        theme_cursor = theme_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        theme = catalog[theme_cursor].clone();
+                        highlighter =
+                            Highlighter::with_theme(&theme.syntect_theme, &theme.syntax_overrides);
+                        needs_render = true;
+                        show_theme_selector = false;
+                    }
+                    _ => {}
+                }
                 continue;
             }
             match key.code {
@@ -345,6 +399,14 @@ fn run_loop(
                         _ => "auto".to_string(),
                     };
                     needs_render = true;
+                }
+                // Open the theme selector, seeding the cursor at the active theme.
+                KeyCode::Char('t') => {
+                    theme_cursor = catalog
+                        .iter()
+                        .position(|t| t.name == theme.name)
+                        .unwrap_or(theme_cursor);
+                    show_theme_selector = true;
                 }
                 // Sidebar: toggle visibility and navigate between files. Moving
                 // selection jumps the main view to that file's start offset.
@@ -443,6 +505,8 @@ struct ReviewFrame<'a> {
     lines: &'a [Line<'static>],
     summaries: &'a [FileSummary],
     opts: &'a RenderOptions,
+    /// Active theme — drives the status-bar and sidebar chrome colors.
+    theme: &'a Theme,
     file_count: usize,
     selected_file: usize,
     offset: u16,
@@ -451,6 +515,12 @@ struct ReviewFrame<'a> {
     wrap: bool,
     sidebar_visible: bool,
     show_help: bool,
+    /// Whether the theme-selector overlay is open.
+    show_theme_selector: bool,
+    /// The curated catalog the selector lists.
+    catalog: &'a [Theme],
+    /// The selector's highlighted row.
+    theme_cursor: usize,
 }
 
 /// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
@@ -468,7 +538,7 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     let main = if v.sidebar_visible && body.width >= SIDEBAR_W + 20 {
         let panes =
             Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(0)]).split(body);
-        frame.render_widget(sidebar(v.summaries, v.selected_file), panes[0]);
+        frame.render_widget(sidebar(v.summaries, v.selected_file, v.theme), panes[0]);
         panes[1]
     } else {
         body
@@ -492,12 +562,16 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
             max_off,
             v.opts,
             v.wrap,
+            v.theme,
         ),
         chunks[1],
     );
 
     if v.show_help {
-        render_help(frame, area);
+        render_help(frame, area, &v.theme.name);
+    }
+    if v.show_theme_selector {
+        render_theme_selector(frame, area, v.catalog, v.theme_cursor, &v.theme.name);
     }
     main.height
 }
@@ -529,7 +603,7 @@ fn truncate_path(path: &str, max: usize) -> String {
 ///
 /// ponytail: no internal scrolling — if there are more files than rows, the
 /// overflow is clipped. Fine for typical review sizes; revisit for huge diffs.
-fn sidebar(summaries: &[FileSummary], selected: usize) -> Paragraph<'static> {
+fn sidebar(summaries: &[FileSummary], selected: usize, theme: &Theme) -> Paragraph<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" files ")
@@ -557,12 +631,12 @@ fn sidebar(summaries: &[FileSummary], selected: usize) -> Paragraph<'static> {
             rows.push(Line::from(vec![
                 Span::raw(path),
                 Span::raw(" ".repeat(pad)),
-                Span::styled(
-                    format!("+{}", s.additions),
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled(format!("+{}", s.additions), Style::default().fg(theme.add)),
                 Span::raw(" "),
-                Span::styled(format!("-{}", s.deletions), Style::default().fg(Color::Red)),
+                Span::styled(
+                    format!("-{}", s.deletions),
+                    Style::default().fg(theme.remove),
+                ),
             ]));
         }
     }
@@ -579,6 +653,7 @@ fn status_bar(
     max_offset: u16,
     opts: &RenderOptions,
     wrap: bool,
+    theme: &Theme,
 ) -> Paragraph<'static> {
     let pct = if max_offset == 0 {
         100
@@ -620,14 +695,16 @@ fn status_bar(
     let text = format!(" file {pos}/{file_count}  {pct}%  [{toggles}]  s sidebar  e edit  ? help ");
     Paragraph::new(text).style(
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(theme.status_fg)
+            .bg(theme.status_bg)
             .add_modifier(Modifier::BOLD),
     )
 }
 
-/// Render the centered, bordered help overlay listing every keybinding.
-fn render_help(frame: &mut Frame, area: Rect) {
+/// Render the centered, bordered help overlay listing every keybinding. The
+/// active theme name is shown so the user can see what `t` will be switching from.
+fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
+    let theme_line = format!("  theme: {active_theme}");
     let help = [
         "  Keybindings",
         "",
@@ -647,10 +724,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "  H   toggle hunk headers",
         "  c   toggle context collapse",
         "  m   cycle layout auto/split/stack",
+        "  t   theme selector",
         "",
         "  e   open file in $EDITOR",
         "  Ctrl-Z suspend  Ctrl-C quit",
         "",
+        &theme_line,
         "  ?   toggle this help",
         "  q   quit   (Esc closes help)",
     ];
@@ -666,6 +745,46 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .title(" help ")
         .style(Style::default().fg(Color::White).bg(Color::Black));
     // Clear the cells behind the popup so the diff does not bleed through.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Render the centered theme-selector overlay: the curated catalog with the
+/// cursor row highlighted and the currently-active theme marked. Mirrors the
+/// help overlay's centered, cleared, bordered popup.
+fn render_theme_selector(
+    frame: &mut Frame,
+    area: Rect,
+    catalog: &[Theme],
+    cursor: usize,
+    active: &str,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(catalog.len() + 2);
+    lines.push(Line::from("  Theme  (Enter apply, Esc cancel)".to_string()));
+    lines.push(Line::from(""));
+    for (i, t) in catalog.iter().enumerate() {
+        // Marker column: `>` cursor row, `*` the active theme, else blank.
+        let marker = if i == cursor { '>' } else { ' ' };
+        let active_mark = if t.name == active { " *" } else { "" };
+        let text = format!("  {marker} {}{active_mark}", t.name);
+        if i == cursor {
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(text));
+        }
+    }
+
+    let width = 36.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" themes ")
+        .style(Style::default().fg(Color::White).bg(Color::Black));
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -754,8 +873,10 @@ index 5555555..6666666 100644
     fn renders_sidebar_and_main_view() {
         let model = parse_unified_diff_colored(MULTI_FILE);
         let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let catalog = crate::theme::catalog();
         let opts = RenderOptions::default();
-        let rendered = render_diff(&model, &highlighter, &opts, 80);
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, 80);
         let summaries = file_summaries(&model);
 
         // Select the second file and scroll the main view to its start.
@@ -765,6 +886,7 @@ index 5555555..6666666 100644
             lines: &rendered.lines,
             summaries: &summaries,
             opts: &opts,
+            theme: &theme,
             file_count: model.files.len(),
             selected_file,
             offset,
@@ -772,6 +894,9 @@ index 5555555..6666666 100644
             wrap: false,
             sidebar_visible: true,
             show_help: false,
+            show_theme_selector: false,
+            catalog: &catalog,
+            theme_cursor: 0,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -817,6 +942,8 @@ index 5555555..6666666 100644
         // the split main view + the SPLIT status-bar indicator.
         let model = parse_unified_diff_colored(MULTI_FILE);
         let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let catalog = crate::theme::catalog();
 
         // Sidebar hidden so the whole 130-col width is the main content; auto
         // then resolves to split (130 >= AUTO_SPLIT_MIN).
@@ -833,12 +960,13 @@ index 5555555..6666666 100644
             mode,
             ..RenderOptions::default()
         };
-        let rendered = render_diff(&model, &highlighter, &opts, main_width);
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, main_width);
         let summaries = file_summaries(&model);
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
             opts: &opts,
+            theme: &theme,
             file_count: model.files.len(),
             selected_file: 0,
             offset: 0,
@@ -846,6 +974,9 @@ index 5555555..6666666 100644
             wrap: false,
             sidebar_visible,
             show_help: false,
+            show_theme_selector: false,
+            catalog: &catalog,
+            theme_cursor: 0,
         };
 
         let backend = TestBackend::new(130, 20);
