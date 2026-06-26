@@ -1,0 +1,19 @@
+[package]
+name = "revu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A fast, memory-safe terminal diff/review tool (a Rust port of hunk)"
+repository = "https://github.com/lgbarn/revu"
+readme = "README.md"
+
+[dependencies]
+# clap: CLI parsing. ratatui: TUI rendering (re-exports crossterm, so no
+# separate crossterm dependency). anyhow: ergonomic error propagation.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+
+[dev-dependencies]
+# insta: snapshot testing of rendered terminal buffers.
+insta = "1"

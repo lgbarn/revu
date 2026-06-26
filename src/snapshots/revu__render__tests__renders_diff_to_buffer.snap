@@ -1,0 +1,16 @@
+---
+source: src/render.rs
+expression: terminal.backend()
+---
+"── src/main.rs                                    "
+"@@ -1,2 +1,3 @@                                   "
+" fn main() {                                      "
+"-    println!("old");                             "
+"+    println!("new");                             "
+"+    // added line                                "
+" }                                                "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "
+"                                                  "

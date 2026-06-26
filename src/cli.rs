@@ -1,0 +1,18 @@
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "revu",
+    version,
+    about = "Terminal diff/review tool (a Rust port of hunk)"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Review the working-tree diff
+    Diff,
+}
