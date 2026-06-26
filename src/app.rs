@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -75,6 +75,25 @@ pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Resul
     adapter.repo_root()?;
     let reff = reff.unwrap_or_else(|| "stash@{0}".to_string());
     let text = adapter.stash_show(&reff)?;
+    review_text(&text, &overrides)
+}
+
+/// `revu difftool <left> <right> [path]`: render the diff between two file
+/// paths, as invoked by `git difftool` (which passes the LOCAL and REMOTE temp
+/// files, optionally the in-repo path). Uses `git diff --no-index`, so it does
+/// NOT require a repository (no `repo_root` call).
+///
+/// ponytail: `path` is accepted for `git difftool` compatibility but unused in
+/// v1. Syntax highlighting already derives the language from the diff's file
+/// headers (which `--no-index` populates with the real paths), so the extra
+/// hint is redundant. Wire it into highlight selection if that ever changes.
+pub fn run_difftool(
+    left: String,
+    right: String,
+    _path: Option<String>,
+    overrides: ConfigOverrides,
+) -> Result<()> {
+    let text = GitAdapter::new().diff_files(&left, &right)?;
     review_text(&text, &overrides)
 }
 
@@ -202,6 +221,23 @@ fn run_loop(
             }
             match key.code {
                 KeyCode::Char('q') => break,
+                // Ctrl-C: in raw mode crossterm delivers it as a key event, not
+                // a signal, so quit explicitly (the shared restore path runs).
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                // Ctrl-Z: suspend to the shell with the terminal restored, then
+                // resume into a fresh alternate screen. Unix only; elsewhere the
+                // event falls through to the no-op arm.
+                #[cfg(unix)]
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    suspend_and_resume(terminal);
+                }
+                // Open the currently selected file in $EDITOR. No-op when the
+                // diff has no files.
+                KeyCode::Char('e') => {
+                    if let Some(summary) = summaries.get(selected_file) {
+                        open_in_editor(terminal, &summary.path);
+                    }
+                }
                 // Esc closes help if open, otherwise quits.
                 KeyCode::Esc => {
                     if show_help {
@@ -269,6 +305,65 @@ fn run_loop(
     }
     .save();
     Ok(())
+}
+
+/// Resolve which editor to launch: `$VISUAL`, else `$EDITOR`, else `vi`. The
+/// spec is split on whitespace into a program plus its base args (the file path
+/// is appended by the caller). Pure — the env values are passed in so it never
+/// reads the environment and can be tested deterministically.
+///
+/// ponytail: whitespace split, not full shell-word parsing (mirrors
+/// `pager.rs`). Covers `code -w` and bare program names; quoted args in the
+/// editor spec are a later refinement.
+fn editor_command(visual: Option<&str>, editor: Option<&str>) -> (String, Vec<String>) {
+    let spec = visual
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| editor.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("vi");
+    let mut parts = spec.split_whitespace();
+    let program = parts.next().unwrap_or("vi").to_string();
+    let args = parts.map(str::to_string).collect();
+    (program, args)
+}
+
+/// Suspend the TUI, run `$EDITOR <path>` as a foreground child (inheriting our
+/// stdio so the editor takes over the terminal), then re-enter the alternate
+/// screen. The path is a discrete arg-vector element appended after the
+/// editor's base args, so there is no shell and nothing in it can be
+/// interpreted as a command. Best-effort: a spawn failure must not break the
+/// review, but we always re-enter the UI afterwards.
+fn open_in_editor(terminal: &mut DefaultTerminal, path: &str) {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    let (program, args) = editor_command(visual.as_deref(), editor.as_deref());
+
+    // Leave the alternate screen + raw mode so the editor owns the terminal.
+    ratatui::restore();
+    let _ = std::process::Command::new(&program)
+        .args(&args)
+        .arg(path)
+        .status();
+    // Re-enter our UI regardless of how (or whether) the editor ran. The next
+    // loop iteration redraws.
+    *terminal = ratatui::init();
+}
+
+/// Suspend the process to the shell (Ctrl-Z semantics) with the terminal
+/// restored, then resume into a fresh alternate screen. Restores cooked mode +
+/// the normal screen, raises `SIGTSTP` on our own pid via rustix (no libc), and
+/// the `kill` call returns once the shell continues us (`fg` -> `SIGCONT`).
+#[cfg(unix)]
+fn suspend_and_resume(terminal: &mut DefaultTerminal) {
+    use rustix::process::{getpid, kill_process, Signal};
+
+    // Hand the terminal back in a sane state before stopping.
+    ratatui::restore();
+    // Stop ourselves; control returns to the shell. Best-effort — if the signal
+    // cannot be raised we simply re-enter below rather than hanging.
+    let _ = kill_process(getpid(), Signal::Tstp);
+    // Foregrounded again: re-enter the alternate screen; the loop redraws.
+    *terminal = ratatui::init();
 }
 
 /// Everything `draw_review` needs to paint one frame. Bundled so the live loop
@@ -446,7 +541,7 @@ fn status_bar(
     } else {
         selected_file + 1
     };
-    let text = format!(" file {pos}/{file_count}  {pct}%  [{toggles}]  s sidebar  ? help ");
+    let text = format!(" file {pos}/{file_count}  {pct}%  [{toggles}]  s sidebar  e edit  ? help ");
     Paragraph::new(text).style(
         Style::default()
             .fg(Color::Black)
@@ -475,6 +570,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "  w   toggle line wrap",
         "  H   toggle hunk headers",
         "  c   toggle context collapse",
+        "",
+        "  e   open file in $EDITOR",
+        "  Ctrl-Z suspend  Ctrl-C quit",
         "",
         "  ?   toggle this help",
         "  q   quit   (Esc closes help)",
@@ -542,6 +640,38 @@ index 5555555..6666666 100644
 -old body
 +new title
 ";
+
+    #[test]
+    fn editor_command_prefers_visual_over_editor() {
+        let (prog, args) = editor_command(Some("nvim"), Some("vi"));
+        assert_eq!(prog, "nvim");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn editor_command_falls_back_to_editor_then_vi() {
+        let (prog, _) = editor_command(None, Some("emacs"));
+        assert_eq!(prog, "emacs");
+
+        let (prog, args) = editor_command(None, None);
+        assert_eq!(prog, "vi");
+        assert!(args.is_empty());
+
+        // Blank/whitespace specs are ignored, falling through to the next source.
+        let (prog, _) = editor_command(Some("   "), Some("nano"));
+        assert_eq!(prog, "nano");
+        let (prog, _) = editor_command(Some(""), None);
+        assert_eq!(prog, "vi");
+    }
+
+    #[test]
+    fn editor_command_splits_multiword_spec() {
+        // A multi-word spec splits into program + base args; the caller appends
+        // the file path, so the resolver must NOT include it.
+        let (prog, args) = editor_command(Some("code -w --reuse-window"), None);
+        assert_eq!(prog, "code");
+        assert_eq!(args, vec!["-w".to_string(), "--reuse-window".to_string()]);
+    }
 
     #[test]
     fn renders_sidebar_and_main_view() {
