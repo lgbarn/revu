@@ -157,19 +157,23 @@ fn layout_rows(
         };
     }
     match opts.mode {
-        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts),
+        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, width),
         LayoutMode::Split => split_rows(model, highlighter, theme, opts, width),
     }
 }
 
 /// The unified (stack) layout: a flat list of styled lines, old/new interleaved.
-/// This is the original `render_diff` body, untouched, so its output stays
-/// byte-identical to before split was added.
+///
+/// `width` is used only to right-pad added/removed rows with spaces so their
+/// background tint spans the full row. Padding with spaces leaves the rendered
+/// *symbols* identical to the terminal's own blank-cell fill, so snapshots are
+/// unaffected; the tint is a pure background-style change drawn on top.
 fn stack_rows(
     model: &DiffModel,
     highlighter: &Highlighter,
     theme: &Theme,
     opts: &RenderOptions,
+    width: u16,
 ) -> RenderedDiff {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
@@ -237,6 +241,7 @@ fn stack_rows(
 
                 let collapsed = opts.context_collapsed && dl.kind == LineKind::Context;
                 if !collapsed {
+                    let (row_bg, emph_bg) = row_tint(dl, theme);
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if opts.line_numbers {
                         let gutter = match (on_new_side, new_line) {
@@ -247,13 +252,27 @@ fn stack_rows(
                     }
                     spans.push(Span::styled(prefix.to_string(), prefix_style));
                     // Emit the syntax-highlighted content, layering word-level
-                    // emphasis (underline) over the changed byte ranges. The
-                    // text is identical either way — only the style differs.
+                    // emphasis over the changed byte ranges. The text is identical
+                    // either way — only the style differs.
                     let mut byte_pos = 0usize;
                     for (color, text) in highlighted {
                         let len = text.len();
-                        push_content_spans(&mut spans, &text, byte_pos, color, &dl.emphasis);
+                        push_content_spans(
+                            &mut spans,
+                            &text,
+                            byte_pos,
+                            color,
+                            &dl.emphasis,
+                            emph_bg,
+                        );
                         byte_pos += len;
+                    }
+                    // Added/removed rows get a full-row background tint: pad to the
+                    // row width with spaces, then paint the tint behind every span
+                    // that isn't already carrying the stronger emphasis background.
+                    if let Some(bg) = row_bg {
+                        pad_to_width(&mut spans, width as usize);
+                        apply_row_bg(&mut spans, bg);
                     }
                     out.push(Line::from(spans));
                 }
@@ -424,6 +443,7 @@ fn build_cell(
     col_w: usize,
 ) -> Vec<Span<'static>> {
     let (prefix, prefix_style) = prefix_for(dl, theme);
+    let (row_bg, emph_bg) = row_tint(dl, theme);
     let mut spans: Vec<Span<'static>> = Vec::new();
     if opts.line_numbers {
         let g = match gutter {
@@ -433,8 +453,51 @@ fn build_cell(
         spans.push(Span::styled(g, Style::default().fg(theme.gutter)));
     }
     spans.push(Span::styled(prefix.to_string(), prefix_style));
-    append_content_spans(&mut spans, highlighted, &dl.emphasis);
-    fit_to_width(spans, col_w)
+    append_content_spans(&mut spans, highlighted, &dl.emphasis, emph_bg);
+    // The cell is already padded to `col_w` by `fit_to_width`, so the tint reaches
+    // the column edge once painted behind every not-yet-backgrounded span.
+    let mut cell = fit_to_width(spans, col_w);
+    if let Some(bg) = row_bg {
+        apply_row_bg(&mut cell, bg);
+    }
+    cell
+}
+
+/// The full-row background tint and the stronger word-emphasis background for a
+/// diff line. Added/removed lines get the theme's add/remove tint plus a vivid
+/// emphasis hue for the changed words; context lines get neither. Moved lines
+/// (git `--color-moved`) are left untinted so their distinct prefix hue keeps
+/// them from reading as a plain add/remove.
+fn row_tint(dl: &DiffLine, theme: &Theme) -> (Option<Color>, Option<Color>) {
+    if dl.moved {
+        return (None, None);
+    }
+    match dl.kind {
+        LineKind::Add => (Some(theme.add_bg), Some(theme.add)),
+        LineKind::Remove => (Some(theme.remove_bg), Some(theme.remove)),
+        LineKind::Context => (None, None),
+    }
+}
+
+/// Append a trailing space run so `spans` reach `width` display columns (chars).
+/// No-op when already at/over `width`. The pad is plain spaces, matching the
+/// terminal's own blank-cell fill, so it never changes a snapshot's symbols.
+fn pad_to_width(spans: &mut Vec<Span<'static>>, width: usize) {
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+}
+
+/// Paint `bg` behind every span that has no explicit background, leaving the
+/// emphasized word ranges on their stronger hue. Pure style mutation — the
+/// rendered text is untouched.
+fn apply_row_bg(spans: &mut [Span<'static>], bg: Color) {
+    for span in spans.iter_mut() {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(bg);
+        }
+    }
 }
 
 /// An empty `col_w`-wide cell (the blank side of a lopsided change group).
@@ -467,11 +530,12 @@ fn append_content_spans(
     spans: &mut Vec<Span<'static>>,
     highlighted: &[(Color, String)],
     emphasis: &[(usize, usize)],
+    emph_bg: Option<Color>,
 ) {
     let mut byte_pos = 0usize;
     for (color, text) in highlighted {
         let len = text.len();
-        push_content_spans(spans, text, byte_pos, *color, emphasis);
+        push_content_spans(spans, text, byte_pos, *color, emphasis, emph_bg);
         byte_pos += len;
     }
 }
@@ -518,6 +582,19 @@ fn compose_row(
     Line::from(left)
 }
 
+/// The index of the file whose rendered region contains scroll `offset`: the
+/// last file whose start line is `<= offset`. This derives the active file from
+/// the scroll position so plain scrolling moves through files. Returns 0 when
+/// `file_starts` is empty or `offset` precedes the first file. `file_starts` is
+/// ascending (as produced by [`render_diff`]), so a partition point locates the
+/// boundary in O(log n).
+pub fn file_at_offset(file_starts: &[usize], offset: usize) -> usize {
+    match file_starts.partition_point(|&start| start <= offset) {
+        0 => 0,
+        n => n - 1,
+    }
+}
+
 /// Parse the old-side start line from a unified hunk header `@@ -old,n +new,m @@`,
 /// returning `old`. Mirrors [`parse_hunk_new_start`] for the left column's
 /// gutter. Returns `None` if no `-<digits>` group is present.
@@ -554,12 +631,17 @@ pub fn parse_hunk_new_start(header: &str) -> Option<usize> {
 /// The token is split only at emphasis boundaries, which sit on char boundaries
 /// (word-diff ranges and syntect tokens both respect UTF-8), so slicing is safe
 /// and the visible text is byte-for-byte unchanged — emphasis is style-only.
+///
+/// `emph_bg` is the stronger background painted behind emphasized ranges so the
+/// changed words stay legible against the row tint (`None` keeps the prior
+/// underline-only treatment, e.g. for moved lines).
 fn push_content_spans(
     spans: &mut Vec<Span<'static>>,
     text: &str,
     start: usize,
     color: Color,
     emphasis: &[(usize, usize)],
+    emph_bg: Option<Color>,
 ) {
     if text.is_empty() {
         return;
@@ -579,12 +661,12 @@ fn push_content_spans(
         }
         let here = byte_emphasized(start + rel, emphasis);
         if here != cur {
-            spans.push(styled_segment(&text[seg_start..rel], base, cur));
+            spans.push(styled_segment(&text[seg_start..rel], base, cur, emph_bg));
             seg_start = rel;
             cur = here;
         }
     }
-    spans.push(styled_segment(&text[seg_start..], base, cur));
+    spans.push(styled_segment(&text[seg_start..], base, cur, emph_bg));
 }
 
 /// Whether byte position `pos` lies inside any emphasis range.
@@ -592,10 +674,21 @@ fn byte_emphasized(pos: usize, emphasis: &[(usize, usize)]) -> bool {
     emphasis.iter().any(|&(s, e)| pos >= s && pos < e)
 }
 
-/// A content sub-span with the base syntax style, underlined when emphasized.
-fn styled_segment(text: &str, base: Style, emphasized: bool) -> Span<'static> {
+/// A content sub-span with the base syntax style; when emphasized it is
+/// underlined and, if `emph_bg` is set, painted on the stronger emphasis
+/// background so the changed words pop against the row tint.
+fn styled_segment(
+    text: &str,
+    base: Style,
+    emphasized: bool,
+    emph_bg: Option<Color>,
+) -> Span<'static> {
     let style = if emphasized {
-        base.add_modifier(Modifier::UNDERLINED)
+        let s = base.add_modifier(Modifier::UNDERLINED);
+        match emph_bg {
+            Some(bg) => s.bg(bg),
+            None => s,
+        }
     } else {
         base
     };
@@ -622,6 +715,64 @@ index e69de29..4b825dc 100644
 +    // added line
  }
 ";
+
+    #[test]
+    fn changed_rows_get_full_width_background_tint() {
+        let model = parse_unified_diff(SAMPLE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let width: u16 = 50;
+        let lines = render_lines(
+            &model,
+            &highlighter,
+            &theme,
+            &RenderOptions::default(),
+            width,
+        );
+
+        // Char width of a line's visible text (what the user sees / a snapshot
+        // captures). Used to confirm the tint pad reaches the row width.
+        let char_width = |l: &Line<'static>| -> usize {
+            l.spans.iter().map(|s| s.content.chars().count()).sum()
+        };
+        // Whether EVERY span of a line carries a background (the tint covers the
+        // whole row, including gutter, prefix, content, and the trailing pad).
+        let fully_backed = |l: &Line<'static>| l.spans.iter().all(|s| s.style.bg.is_some());
+
+        let added = lines
+            .iter()
+            .find(|l| l.to_string().contains("// added line"))
+            .expect("added line present");
+        assert!(
+            added.spans.iter().any(|s| s.style.bg == Some(theme.add_bg)),
+            "added row should carry the add_bg tint"
+        );
+        assert!(fully_backed(added), "add tint must span the full row");
+        assert_eq!(char_width(added), width as usize, "add row padded to width");
+
+        let removed = lines
+            .iter()
+            .find(|l| l.to_string().contains(r#"println!("old")"#))
+            .expect("removed line present");
+        assert!(
+            removed
+                .spans
+                .iter()
+                .any(|s| s.style.bg == Some(theme.remove_bg)),
+            "removed row should carry the remove_bg tint"
+        );
+        assert!(fully_backed(removed), "remove tint must span the full row");
+
+        // Context rows keep the default background (no tint, no forced pad span).
+        let context = lines
+            .iter()
+            .find(|l| l.to_string().contains("fn main()"))
+            .expect("context line present");
+        assert!(
+            context.spans.iter().all(|s| s.style.bg.is_none()),
+            "context row must not be tinted"
+        );
+    }
 
     #[test]
     fn renders_diff_to_buffer() {
@@ -846,6 +997,33 @@ index 3333333..4444444 100644
         // No `+` group at all.
         assert_eq!(parse_hunk_new_start("not a hunk header"), None);
         assert_eq!(parse_hunk_new_start("@@ -1,2 @@"), None);
+    }
+
+    #[test]
+    fn file_at_offset_derives_active_file_from_scroll() {
+        // Empty: always file 0.
+        assert_eq!(file_at_offset(&[], 0), 0);
+        assert_eq!(file_at_offset(&[], 42), 0);
+
+        let starts = [0usize, 10, 25];
+        // Before / at the first start -> file 0.
+        assert_eq!(file_at_offset(&starts, 0), 0);
+        assert_eq!(file_at_offset(&starts, 5), 0);
+        // Exactly at a start -> that file.
+        assert_eq!(file_at_offset(&starts, 10), 1);
+        assert_eq!(file_at_offset(&starts, 25), 2);
+        // Between starts -> the earlier file.
+        assert_eq!(file_at_offset(&starts, 24), 1);
+        assert_eq!(file_at_offset(&starts, 11), 1);
+        // Past the last start -> the last file.
+        assert_eq!(file_at_offset(&starts, 999), 2);
+
+        // A leading non-zero start (offset before the first file) -> file 0.
+        let offset_starts = [5usize, 20];
+        assert_eq!(file_at_offset(&offset_starts, 0), 0);
+        assert_eq!(file_at_offset(&offset_starts, 4), 0);
+        assert_eq!(file_at_offset(&offset_starts, 5), 0);
+        assert_eq!(file_at_offset(&offset_starts, 20), 1);
     }
 
     #[test]
