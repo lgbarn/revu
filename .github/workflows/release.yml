@@ -25,7 +25,7 @@ jobs:
           if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
               --title "${GITHUB_REF_NAME}" \
-              --generate-notes
+              --notes "revu ${GITHUB_REF_NAME}"
           fi
 
   upload-binaries:
