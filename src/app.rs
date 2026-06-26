@@ -411,17 +411,13 @@ fn run_loop(
                 // Sidebar: toggle visibility and navigate between files. Moving
                 // selection jumps the main view to that file's start offset.
                 KeyCode::Char('s') => sidebar_visible = !sidebar_visible,
-                KeyCode::Tab | KeyCode::Char(']') => {
-                    if !file_starts.is_empty() {
-                        selected_file = (selected_file + 1).min(file_starts.len() - 1);
-                        offset = file_to_offset(&file_starts, selected_file, max_offset);
-                    }
+                KeyCode::Tab | KeyCode::Char(']') if !file_starts.is_empty() => {
+                    selected_file = (selected_file + 1).min(file_starts.len() - 1);
+                    offset = file_to_offset(&file_starts, selected_file, max_offset);
                 }
-                KeyCode::BackTab | KeyCode::Char('[') => {
-                    if !file_starts.is_empty() {
-                        selected_file = selected_file.saturating_sub(1);
-                        offset = file_to_offset(&file_starts, selected_file, max_offset);
-                    }
+                KeyCode::BackTab | KeyCode::Char('[') if !file_starts.is_empty() => {
+                    selected_file = selected_file.saturating_sub(1);
+                    offset = file_to_offset(&file_starts, selected_file, max_offset);
                 }
                 _ => {}
             }

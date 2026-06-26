@@ -1,5 +1,7 @@
 # revu
 
+[![CI](https://github.com/lgbarn/revu/actions/workflows/ci.yml/badge.svg)](https://github.com/lgbarn/revu/actions/workflows/ci.yml)
+
 A fast, memory-safe terminal diff/review tool in Rust — a behavioral-equivalence
 port of [hunk](https://github.com/modem-dev/hunk), built to escape the npm
 supply chain and ship as a single static binary with no runtime.
@@ -16,6 +18,39 @@ day-to-day workflow with:
 - **A small, auditable dependency tree** — enforced in CI (`cargo-deny`,
   `cargo-audit`, and a transitive-crate budget).
 - **No telemetry, ever** — no phone-home update check.
+
+## Install
+
+revu ships as a single static binary with no runtime and no npm package.
+
+### Prebuilt binaries (fastest)
+
+Download the archive for your platform from the
+[latest release](https://github.com/lgbarn/revu/releases/latest), unpack it, and
+put `revu` on your `PATH`. Static musl Linux (x86_64, aarch64) and macOS (Intel,
+Apple Silicon) builds are published per tag.
+
+### cargo binstall
+
+Fetches the prebuilt release binary instead of compiling:
+
+```sh
+cargo binstall revu
+```
+
+### Homebrew
+
+```sh
+brew install lgbarn/tap/revu
+```
+
+(Requires the tap repo to exist; see `packaging/homebrew/revu.rb`.)
+
+### cargo install (build from source)
+
+```sh
+cargo install revu
+```
 
 ## Status
 
