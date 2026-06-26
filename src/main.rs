@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod diff;
+mod pager;
 mod render;
 mod vcs;
 
@@ -21,5 +22,7 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Diff => app::run_diff(),
+        Command::Pager => pager::run_pager(),
+        Command::Patch { file } => pager::run_patch(file),
     }
 }

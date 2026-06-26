@@ -15,4 +15,13 @@ pub struct Cli {
 pub enum Command {
     /// Review the working-tree diff
     Diff,
+
+    /// Render a diff piped on stdin; usable as git's core.pager
+    Pager,
+
+    /// Review a patch file, or a piped diff with `-` (or no argument)
+    Patch {
+        /// Patch file to review; `-` or omitted reads from stdin
+        file: Option<String>,
+    },
 }
