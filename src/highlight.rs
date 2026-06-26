@@ -3,9 +3,13 @@
 //! bundled syntax and theme sets — both expensive to build — so it is created
 //! once and shared by the renderer.
 
+use std::str::FromStr;
+
 use ratatui::style::Color;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
+use syntect::highlighting::{
+    Color as SynColor, ScopeSelectors, Style as SynStyle, StyleModifier, Theme, ThemeItem, ThemeSet,
+};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Owns the loaded syntax + theme sets and the active theme. Construct once
@@ -17,21 +21,33 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
-    /// Build the highlighter from syntect's bundled defaults.
+    /// Build the highlighter on the default `base16-ocean.dark` syntect theme
+    /// with no custom token overrides. Retained for tests and the `Default` impl;
+    /// the live app uses [`Highlighter::with_theme`] to honor the active theme.
+    pub fn new() -> Self {
+        Self::with_theme("base16-ocean.dark", &[])
+    }
+
+    /// Build the highlighter on a named bundled syntect theme, injecting any
+    /// custom `[custom_theme.syntax]` token overrides.
     ///
     /// `load_defaults_newlines` is used (rather than `load_defaults_nonewlines`)
     /// because we feed the highlighter one line at a time with its trailing
-    /// newline re-appended, which the newline-aware syntaxes expect.
-    pub fn new() -> Self {
+    /// newline re-appended, which the newline-aware syntaxes expect. An unknown
+    /// `syntect_theme_name` falls back to `base16-ocean.dark`, then to any
+    /// bundled theme, so it can never panic. `syntax_overrides` are token-name ->
+    /// color pairs (already hex-validated by [`crate::theme`]) layered on top of
+    /// the base theme.
+    pub fn with_theme(syntect_theme_name: &str, syntax_overrides: &[(String, Color)]) -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let mut theme_set = ThemeSet::load_defaults();
-        // `base16-ocean.dark` is always present in the bundled set; fall back to
-        // the first available theme rather than panicking if that ever changes.
-        let theme = theme_set
+        let mut theme = theme_set
             .themes
-            .remove("base16-ocean.dark")
+            .remove(syntect_theme_name)
+            .or_else(|| theme_set.themes.remove("base16-ocean.dark"))
             .or_else(|| theme_set.themes.values().next().cloned())
             .expect("syntect bundles at least one default theme");
+        apply_syntax_overrides(&mut theme, syntax_overrides);
         Self { syntax_set, theme }
     }
 
@@ -95,6 +111,75 @@ impl Default for Highlighter {
 /// channel is dropped (terminals do not blend), so only `r,g,b` are used.
 fn syn_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
+}
+
+/// Layer a custom theme's token-color overrides onto a syntect [`Theme`]. Each
+/// token name is mapped to its TextMate scope via [`token_scope`], then:
+///
+/// 1. Any base rule covering that EXACT scope is stripped. This matters because
+///    syntect resolves ties with a strictly-greater score (`update_scored`), so a
+///    naively-appended rule with the same scope as a base rule loses to it. By
+///    removing the base coverage first, the appended override becomes the sole
+///    provider for that scope and reliably wins.
+/// 2. The override `ThemeItem` is appended (foreground only — backgrounds are
+///    ignored by the renderer in favor of the terminal background).
+///
+/// Non-truecolor or unparseable entries are skipped (the base color stands).
+fn apply_syntax_overrides(theme: &mut Theme, overrides: &[(String, Color)]) {
+    for (token, color) in overrides {
+        let Color::Rgb(r, g, b) = *color else {
+            continue;
+        };
+        let selectors = match ScopeSelectors::from_str(&token_scope(token)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // The single Scope this override targets (when it is one). Strip every
+        // base selector covering exactly that scope so the tie-break can't keep
+        // the base color in place.
+        if let Some(target) = selectors
+            .selectors
+            .first()
+            .and_then(|s| s.extract_single_scope())
+        {
+            for item in &mut theme.scopes {
+                item.scope
+                    .selectors
+                    .retain(|sel| sel.extract_single_scope() != Some(target));
+            }
+            theme.scopes.retain(|item| !item.scope.selectors.is_empty());
+        }
+        theme.scopes.push(ThemeItem {
+            scope: selectors,
+            style: StyleModifier {
+                foreground: Some(SynColor { r, g, b, a: 0xff }),
+                background: None,
+                font_style: None,
+            },
+        });
+    }
+}
+
+/// Map a friendly token name (as used in `[custom_theme.syntax]`) to its
+/// TextMate scope selector. Unknown tokens pass through verbatim so a caller can
+/// target any scope directly.
+fn token_scope(token: &str) -> String {
+    match token {
+        "keyword" => "keyword",
+        "string" => "string",
+        "comment" => "comment",
+        "function" => "entity.name.function",
+        "number" => "constant.numeric",
+        "type" => "entity.name.type",
+        "constant" => "constant",
+        "variable" => "variable",
+        "operator" => "keyword.operator",
+        "punctuation" => "punctuation",
+        "tag" => "entity.name.tag",
+        "attribute" => "entity.other.attribute-name",
+        other => return other.to_string(),
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -174,6 +259,42 @@ mod tests {
         let kw = color_of("def").expect("`def` span present");
         let ident = color_of("greet").expect("`greet` span present");
         assert_ne!(kw, ident, "keyword and identifier share a color: {spans:?}");
+    }
+
+    #[test]
+    fn syntax_override_recolors_the_targeted_token() {
+        // The `function` token maps to the `entity.name.function` scope, which
+        // colors the `main` identifier. Without the override it has the base
+        // theme's color; with it, it must become pure red.
+        let syntax_name = "x.rs";
+        let base = Highlighter::with_theme("base16-ocean.dark", &[]);
+        let base_color = {
+            let syntax = base.syntax_for_path(syntax_name);
+            let mut hl = base.line_highlighter(syntax);
+            base.highlight_line(&mut hl, "fn main() {}")
+                .into_iter()
+                .find(|(_, t)| t.contains("main"))
+                .map(|(c, _)| c)
+                .expect("`main` span present")
+        };
+        assert_ne!(base_color, Color::Rgb(255, 0, 0), "fixture color clashes");
+
+        let overrides = vec![("function".to_string(), Color::Rgb(255, 0, 0))];
+        let h = Highlighter::with_theme("base16-ocean.dark", &overrides);
+        let syntax = h.syntax_for_path(syntax_name);
+        let mut hl = h.line_highlighter(syntax);
+        let spans = h.highlight_line(&mut hl, "fn main() {}");
+
+        let func = spans
+            .iter()
+            .find(|(_, t)| t.contains("main"))
+            .map(|(c, _)| *c)
+            .expect("`main` span present");
+        assert_eq!(
+            func,
+            Color::Rgb(255, 0, 0),
+            "function override not applied: {spans:?}"
+        );
     }
 
     #[test]
