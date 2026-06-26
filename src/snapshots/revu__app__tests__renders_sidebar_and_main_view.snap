@@ -17,4 +17,4 @@ expression: terminal.backend()
 "│                          │                                                    "
 "│                          │                                                    "
 "└──────────────────────────┘                                                    "
-" file 2/3  100%  [LN HDR]  s sidebar  e edit  ? help                            "
+" file 2/3  100%  [LN HDR]  o fold  s sidebar  e edit  ? help                    "
