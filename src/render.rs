@@ -37,23 +37,90 @@ impl Default for RenderOptions {
 /// remove lines and unnumbered rows align with numbered ones.
 const BLANK_GUTTER: &str = "     ";
 
+/// The rendered diff plus the per-file line offsets that let the UI scroll the
+/// main view to a chosen file. `file_starts[i]` is the index in `lines` of the
+/// first rendered line of `model.files[i]` (its header row).
+#[derive(Debug, Clone)]
+pub struct RenderedDiff {
+    pub lines: Vec<Line<'static>>,
+    pub file_starts: Vec<usize>,
+}
+
+/// One row of the file sidebar: a path with its add/remove line counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSummary {
+    pub path: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// Per-file add/remove line counts for the sidebar. `additions` counts
+/// [`LineKind::Add`] lines and `deletions` counts [`LineKind::Remove`] lines
+/// across all hunks of each file. Pure over the model.
+pub fn file_summaries(model: &DiffModel) -> Vec<FileSummary> {
+    model
+        .files
+        .iter()
+        .map(|file| {
+            let mut additions = 0usize;
+            let mut deletions = 0usize;
+            for hunk in &file.hunks {
+                for dl in &hunk.lines {
+                    match dl.kind {
+                        LineKind::Add => additions += 1,
+                        LineKind::Remove => deletions += 1,
+                        LineKind::Context => {}
+                    }
+                }
+            }
+            FileSummary {
+                path: file.path.clone(),
+                additions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
 /// Render the model as a flat list of styled lines (unified/stack layout).
 ///
 /// `highlighter` provides syntax coloring for the diff content. The leading
 /// `+`/`-`/space prefix keeps its add/remove color (the change signal), while
 /// the content after it is colored by language token. `opts` controls the
 /// optional line-number gutter, hunk headers, and context collapsing.
+///
+/// Thin wrapper over [`render_diff`] that drops the per-file offsets, kept so
+/// existing callers (and the snapshot test) need no change. The live UI now
+/// calls [`render_diff`] directly for the offsets, leaving this used only by
+/// tests in this binary crate — hence the `allow`.
+#[allow(dead_code)]
 pub fn render_lines(
     model: &DiffModel,
     highlighter: &Highlighter,
     opts: &RenderOptions,
 ) -> Vec<Line<'static>> {
+    render_diff(model, highlighter, opts).lines
+}
+
+/// Render the model, also recording where each file begins so the UI can jump
+/// the scroll offset to a selected file. See [`RenderedDiff`].
+pub fn render_diff(
+    model: &DiffModel,
+    highlighter: &Highlighter,
+    opts: &RenderOptions,
+) -> RenderedDiff {
     if model.files.is_empty() {
-        return vec![Line::from("No changes in the working tree.")];
+        return RenderedDiff {
+            lines: vec![Line::from("No changes in the working tree.")],
+            file_starts: Vec::new(),
+        };
     }
 
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
     for file in &model.files {
+        // Record the first rendered line index for this file before emitting it.
+        file_starts.push(out.len());
         out.push(Line::from(Span::styled(
             format!("── {} ", file.path),
             Style::default()
@@ -128,7 +195,10 @@ pub fn render_lines(
 
         out.push(Line::from(""));
     }
-    out
+    RenderedDiff {
+        lines: out,
+        file_starts,
+    }
 }
 
 /// Parse the new-side start line from a unified hunk header
@@ -249,6 +319,75 @@ index e69de29..4b825dc 100644
                 .any(|l| l.contains("   2 ") && l.contains("new")),
             "expected line 2 gutter on added line: {text:?}"
         );
+    }
+
+    const TWO_FILE: &str = "\
+diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+@@ -10 +10,2 @@
+ ctx
++added
+diff --git a/b.txt b/b.txt
+index 3333333..4444444 100644
+--- a/b.txt
++++ b/b.txt
+@@ -1 +1 @@
+-removed
++inserted
+";
+
+    #[test]
+    fn file_summaries_counts_adds_and_removes_per_file() {
+        let model = parse_unified_diff(TWO_FILE);
+        let summaries = file_summaries(&model);
+        assert_eq!(summaries.len(), 2);
+        // a.txt: one Remove (old), two Add (new, added).
+        assert_eq!(summaries[0].path, "a.txt");
+        assert_eq!(summaries[0].additions, 2);
+        assert_eq!(summaries[0].deletions, 1);
+        // b.txt: one Remove (removed), one Add (inserted).
+        assert_eq!(summaries[1].path, "b.txt");
+        assert_eq!(summaries[1].additions, 1);
+        assert_eq!(summaries[1].deletions, 1);
+    }
+
+    #[test]
+    fn file_summaries_empty_model_is_empty() {
+        assert!(file_summaries(&DiffModel::default()).is_empty());
+    }
+
+    #[test]
+    fn render_diff_file_starts_point_at_each_file_header() {
+        let model = parse_unified_diff(TWO_FILE);
+        let highlighter = Highlighter::new();
+        let rendered = render_diff(&model, &highlighter, &RenderOptions::default());
+
+        // One entry per file, strictly ascending.
+        assert_eq!(rendered.file_starts.len(), 2);
+        assert!(rendered.file_starts[0] < rendered.file_starts[1]);
+        assert_eq!(rendered.file_starts[0], 0);
+
+        // Each recorded start is that file's header line.
+        let first = rendered.lines[rendered.file_starts[0]].to_string();
+        assert!(first.contains("a.txt"), "first header was {first:?}");
+        let second = rendered.lines[rendered.file_starts[1]].to_string();
+        assert!(second.contains("b.txt"), "second header was {second:?}");
+    }
+
+    #[test]
+    fn render_lines_matches_render_diff_lines() {
+        let model = parse_unified_diff(TWO_FILE);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions::default();
+        let plain = render_lines(&model, &highlighter, &opts);
+        let rendered = render_diff(&model, &highlighter, &opts);
+        assert_eq!(plain.len(), rendered.lines.len());
     }
 
     #[test]

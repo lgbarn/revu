@@ -9,14 +9,14 @@ use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff, DiffModel};
 use crate::highlight::Highlighter;
-use crate::render::{render_lines, RenderOptions};
+use crate::render::{file_summaries, render_diff, FileSummary, RenderOptions};
 use crate::state::ViewState;
 use crate::vcs::git::GitAdapter;
 use crate::vcs::{DiffOptions, VcsAdapter};
@@ -114,6 +114,10 @@ fn reopen_controlling_tty() -> Result<()> {
     Ok(())
 }
 
+/// Preferred sidebar width in columns (border + content). The sidebar is
+/// hidden when the terminal is too narrow to leave room for the main view.
+const SIDEBAR_W: u16 = 28;
+
 /// The interactive review loop. Owns the diff model + highlighter + render
 /// options so display toggles can RE-RENDER the lines in place (rather than
 /// re-running the whole pipeline). Persists the final toggle state to
@@ -126,41 +130,34 @@ fn run_loop(
     mut wrap: bool,
 ) -> Result<()> {
     let file_count = model.files.len();
-    let mut lines = render_lines(model, highlighter, &opts);
+    let initial = render_diff(model, highlighter, &opts);
+    let mut lines = initial.lines;
+    let mut file_starts = initial.file_starts;
+    let summaries = file_summaries(model);
     let mut offset: u16 = 0;
     let mut show_help = false;
+    // Sidebar starts visible; selection tracks which file the main view is on.
+    let mut sidebar_visible = true;
+    let mut selected_file: usize = 0;
 
     loop {
         // Clamp rather than `as u16` so a diff over 65535 lines saturates
         // instead of silently wrapping the scroll bound.
         let total = lines.len().min(u16::MAX as usize) as u16;
+        let view = ReviewFrame {
+            lines: &lines,
+            summaries: &summaries,
+            opts: &opts,
+            file_count,
+            selected_file,
+            offset,
+            total,
+            wrap,
+            sidebar_visible,
+            show_help,
+        };
         let mut view_h = 0u16;
-        terminal.draw(|frame| {
-            let area = frame.area();
-            // Split off a 1-line status bar at the bottom; the rest is the diff.
-            let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-            let body = chunks[0];
-            view_h = body.height;
-
-            // ponytail: clone per frame is wasteful for huge diffs; revisit if
-            // it ever shows up in a profile. Fine for interactive review sizes.
-            let mut paragraph = Paragraph::new(lines.to_vec()).scroll((offset, 0));
-            if wrap {
-                // `trim: false` keeps leading indentation when wrapping.
-                paragraph = paragraph.wrap(Wrap { trim: false });
-            }
-            frame.render_widget(paragraph, body);
-
-            let max_off = total.saturating_sub(body.height);
-            frame.render_widget(
-                status_bar(file_count, offset, max_off, &opts, wrap),
-                chunks[1],
-            );
-
-            if show_help {
-                render_help(frame, area);
-            }
-        })?;
+        terminal.draw(|frame| view_h = draw_review(frame, &view))?;
 
         let max_offset = total.saturating_sub(view_h);
         offset = offset.min(max_offset);
@@ -191,18 +188,41 @@ fn run_loop(
                 KeyCode::Home | KeyCode::Char('g') => offset = 0,
                 KeyCode::End | KeyCode::Char('G') => offset = max_offset,
                 // Display toggles: flip the option and re-render the lines.
+                // hunk-header / context toggles change line counts, so the
+                // per-file offsets are refreshed alongside the lines.
                 KeyCode::Char('n') => {
                     opts.line_numbers = !opts.line_numbers;
-                    lines = render_lines(model, highlighter, &opts);
+                    let r = render_diff(model, highlighter, &opts);
+                    lines = r.lines;
+                    file_starts = r.file_starts;
                 }
                 KeyCode::Char('w') => wrap = !wrap,
                 KeyCode::Char('H') => {
                     opts.hunk_headers = !opts.hunk_headers;
-                    lines = render_lines(model, highlighter, &opts);
+                    let r = render_diff(model, highlighter, &opts);
+                    lines = r.lines;
+                    file_starts = r.file_starts;
                 }
                 KeyCode::Char('c') => {
                     opts.context_collapsed = !opts.context_collapsed;
-                    lines = render_lines(model, highlighter, &opts);
+                    let r = render_diff(model, highlighter, &opts);
+                    lines = r.lines;
+                    file_starts = r.file_starts;
+                }
+                // Sidebar: toggle visibility and navigate between files. Moving
+                // selection jumps the main view to that file's start offset.
+                KeyCode::Char('s') => sidebar_visible = !sidebar_visible,
+                KeyCode::Tab | KeyCode::Char(']') => {
+                    if !file_starts.is_empty() {
+                        selected_file = (selected_file + 1).min(file_starts.len() - 1);
+                        offset = file_to_offset(&file_starts, selected_file, max_offset);
+                    }
+                }
+                KeyCode::BackTab | KeyCode::Char('[') => {
+                    if !file_starts.is_empty() {
+                        selected_file = selected_file.saturating_sub(1);
+                        offset = file_to_offset(&file_starts, selected_file, max_offset);
+                    }
                 }
                 _ => {}
             }
@@ -221,10 +241,144 @@ fn run_loop(
     Ok(())
 }
 
-/// The 1-line status bar: file count, scroll position, active toggles, and a
-/// pointer to the help dialog.
+/// Everything `draw_review` needs to paint one frame. Bundled so the live loop
+/// and the snapshot test render through the exact same code path.
+struct ReviewFrame<'a> {
+    lines: &'a [Line<'static>],
+    summaries: &'a [FileSummary],
+    opts: &'a RenderOptions,
+    file_count: usize,
+    selected_file: usize,
+    offset: u16,
+    /// Total rendered line count (already clamped to `u16::MAX`).
+    total: u16,
+    wrap: bool,
+    sidebar_visible: bool,
+    show_help: bool,
+}
+
+/// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
+/// overlay). Returns the main view height so the caller can clamp the scroll
+/// offset for the next iteration.
+fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
+    let area = frame.area();
+    // Split off a 1-line status bar at the bottom; the rest is the body.
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let body = chunks[0];
+
+    // Split the body into sidebar + main when the sidebar is on AND the terminal
+    // is wide enough to leave a usable main pane; otherwise the main view takes
+    // the whole body (graceful hide on narrow widths).
+    let main = if v.sidebar_visible && body.width >= SIDEBAR_W + 20 {
+        let panes =
+            Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(0)]).split(body);
+        frame.render_widget(sidebar(v.summaries, v.selected_file), panes[0]);
+        panes[1]
+    } else {
+        body
+    };
+
+    // ponytail: clone per frame is wasteful for huge diffs; revisit if it ever
+    // shows up in a profile. Fine for interactive review sizes.
+    let mut paragraph = Paragraph::new(v.lines.to_vec()).scroll((v.offset, 0));
+    if v.wrap {
+        // `trim: false` keeps leading indentation when wrapping.
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(paragraph, main);
+
+    let max_off = v.total.saturating_sub(main.height);
+    frame.render_widget(
+        status_bar(
+            v.file_count,
+            v.selected_file,
+            v.offset,
+            max_off,
+            v.opts,
+            v.wrap,
+        ),
+        chunks[1],
+    );
+
+    if v.show_help {
+        render_help(frame, area);
+    }
+    main.height
+}
+
+/// Map a selected file index to a clamped scroll offset for the main view.
+fn file_to_offset(file_starts: &[usize], idx: usize, max_offset: u16) -> u16 {
+    let start = file_starts.get(idx).copied().unwrap_or(0);
+    (start.min(u16::MAX as usize) as u16).min(max_offset)
+}
+
+/// Truncate a path to `max` columns, keeping the tail (the filename is the most
+/// useful part) and marking the cut with a leading `..`.
+fn truncate_path(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max {
+        return path.to_string();
+    }
+    if max <= 2 {
+        return path.chars().take(max).collect();
+    }
+    let keep = max - 2;
+    let tail: String = path.chars().skip(count - keep).collect();
+    format!("..{tail}")
+}
+
+/// The file sidebar: a bordered list of changed files, each row showing the
+/// (truncated) path with right-aligned `+adds -dels` counts. The selected row
+/// is drawn as a reversed/bold bar. Empty diffs render an empty list.
+///
+/// ponytail: no internal scrolling — if there are more files than rows, the
+/// overflow is clipped. Fine for typical review sizes; revisit for huge diffs.
+fn sidebar(summaries: &[FileSummary], selected: usize) -> Paragraph<'static> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" files ")
+        .style(Style::default().fg(Color::White));
+    // Inner content width = sidebar width minus the two border columns.
+    let inner_w = (SIDEBAR_W as usize).saturating_sub(2);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (i, s) in summaries.iter().enumerate() {
+        let counts = format!("+{} -{}", s.additions, s.deletions);
+        // Reserve room for the counts (plus a one-column gap); the rest is the
+        // path budget.
+        let path_budget = inner_w.saturating_sub(counts.len() + 1).max(1);
+        let path = truncate_path(&s.path, path_budget);
+        let pad = inner_w.saturating_sub(path.chars().count() + counts.len());
+
+        if i == selected {
+            // Selected: one reversed+bold span spanning the inner width.
+            let text = format!("{path}{}{counts}", " ".repeat(pad));
+            rows.push(Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            )));
+        } else {
+            rows.push(Line::from(vec![
+                Span::raw(path),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    format!("+{}", s.additions),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" "),
+                Span::styled(format!("-{}", s.deletions), Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+
+    Paragraph::new(rows).block(block)
+}
+
+/// The 1-line status bar: file position, scroll position, active toggles, and
+/// pointers to the sidebar and help dialog.
 fn status_bar(
     file_count: usize,
+    selected_file: usize,
     offset: u16,
     max_offset: u16,
     opts: &RenderOptions,
@@ -256,8 +410,13 @@ fn status_bar(
         active.join(" ")
     };
 
-    let files = if file_count == 1 { "file" } else { "files" };
-    let text = format!(" {file_count} {files}  {pct}%  [{toggles}]  ? help ");
+    // 1-based file position; an empty diff shows 0/0.
+    let pos = if file_count == 0 {
+        0
+    } else {
+        selected_file + 1
+    };
+    let text = format!(" file {pos}/{file_count}  {pct}%  [{toggles}]  s sidebar  ? help ");
     Paragraph::new(text).style(
         Style::default()
             .fg(Color::Black)
@@ -277,6 +436,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "  PgUp          page up",
         "  g / Home      jump to top",
         "  G / End       jump to bottom",
+        "",
+        "  Tab / ]       next file",
+        "  Shift-Tab / [ previous file",
+        "  s             toggle sidebar",
         "",
         "  n   toggle line numbers",
         "  w   toggle line wrap",
@@ -311,5 +474,77 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         y,
         width: width.min(area.width),
         height: height.min(area.height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::render_diff;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // A 3-file diff so the sidebar lists multiple entries with varied counts.
+    const MULTI_FILE: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
+-fn two() {}
++fn two() -> u8 { 2 }
++fn three() {}
+ fn end() {}
+diff --git a/src/main.rs b/src/main.rs
+index 3333333..4444444 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1,2 @@
+ fn main() {}
++// note
+diff --git a/README.md b/README.md
+index 5555555..6666666 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,1 @@
+-old title
+-old body
++new title
+";
+
+    #[test]
+    fn renders_sidebar_and_main_view() {
+        let model = parse_unified_diff(MULTI_FILE);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions::default();
+        let rendered = render_diff(&model, &highlighter, &opts);
+        let summaries = file_summaries(&model);
+
+        // Select the second file and scroll the main view to its start.
+        let selected_file = 1;
+        let offset = rendered.file_starts[selected_file] as u16;
+        let view = ReviewFrame {
+            lines: &rendered.lines,
+            summaries: &summaries,
+            opts: &opts,
+            file_count: model.files.len(),
+            selected_file,
+            offset,
+            total: rendered.lines.len() as u16,
+            wrap: false,
+            sidebar_visible: true,
+            show_help: false,
+        };
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_review(f, &view);
+            })
+            .unwrap();
+
+        insta::assert_snapshot!(terminal.backend());
     }
 }
