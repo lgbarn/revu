@@ -796,23 +796,27 @@ fn scroll_offset(
             let target = current.saturating_sub(1);
             file_to_offset(file_starts, target, max_offset)
         }
-        // `{`/`}` hop between hunks, mirroring `[`/`]` for files. The `starts`
-        // helpers are generic over any ascending row list, so hunk_starts reuses
-        // file_at_offset / file_to_offset directly.
+        // `{`/`}` hop between hunks. Unlike files (whose first start is row 0),
+        // hunk_starts[0] sits below the file header, so the "current region +/- 1"
+        // trick used for files would skip the first hunk when the cursor is above
+        // it. Instead pick the first hunk strictly below the cursor (`}`) or the
+        // last strictly above it (`{`) via partition_point.
         KeyCode::Char('}') => {
             if hunk_starts.is_empty() {
                 return None;
             }
-            let current = file_at_offset(hunk_starts, offset as usize);
-            let target = (current + 1).min(hunk_starts.len() - 1);
+            let target = hunk_starts
+                .partition_point(|&s| s <= offset as usize)
+                .min(hunk_starts.len() - 1);
             file_to_offset(hunk_starts, target, max_offset)
         }
         KeyCode::Char('{') => {
             if hunk_starts.is_empty() {
                 return None;
             }
-            let current = file_at_offset(hunk_starts, offset as usize);
-            let target = current.saturating_sub(1);
+            let target = hunk_starts
+                .partition_point(|&s| s < offset as usize)
+                .saturating_sub(1);
             file_to_offset(hunk_starts, target, max_offset)
         }
         _ => return None,
@@ -1365,9 +1369,15 @@ index 5555555..6666666 100644
     #[test]
     fn scroll_offset_hunk_navigation() {
         let fs: &[usize] = &[0];
-        // Two hunks starting at rows 3 and 12.
+        // Two hunks starting at rows 3 and 12 (the file header occupies rows 0..3).
         let hs: &[usize] = &[3, 12];
-        // `}` from before the second hunk jumps to it.
+        // From the top (above the first hunk) `}` reaches the FIRST hunk, not the
+        // second — the file-header region must not be treated as "on hunk 0".
+        assert_eq!(
+            scroll_offset(KeyCode::Char('}'), 0, 10, 100, fs, hs),
+            Some(3)
+        );
+        // `}` on the first hunk advances to the second.
         assert_eq!(
             scroll_offset(KeyCode::Char('}'), 3, 10, 100, fs, hs),
             Some(12)
@@ -1381,6 +1391,13 @@ index 5555555..6666666 100644
         assert_eq!(
             scroll_offset(KeyCode::Char('{'), 12, 10, 100, fs, hs),
             Some(3)
+        );
+        // `{` from inside a hunk lands on that hunk's own start (vim `{` feel),
+        // not the previous hunk: cursor at row 15 inside the hunk at row 12.
+        let hs3: &[usize] = &[3, 12, 20];
+        assert_eq!(
+            scroll_offset(KeyCode::Char('{'), 15, 10, 100, fs, hs3),
+            Some(12)
         );
         // With no hunks, `{`/`}` are not handled (return None).
         assert_eq!(scroll_offset(KeyCode::Char('}'), 0, 10, 100, fs, &[]), None);
