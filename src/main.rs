@@ -6,6 +6,7 @@
 //! renders it interactively (`render`).
 
 mod app;
+mod blame;
 mod cli;
 mod config;
 mod diff;

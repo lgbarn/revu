@@ -43,6 +43,8 @@ startup. revu gives you the same day-to-day reviewing experience with:
 - **Syntax highlighting** by language, plus **intra-line word-diff** emphasis and
   **moved-line** coloring (via git's `--color-moved`).
 - **File sidebar** with add/remove counts and keyboard navigation.
+- **Search, blame, and reload**: in-diff search (`/`), an optional `git blame`
+  gutter (`B`, working-tree diffs), and reload-from-source (`r`).
 - **12 built-in themes** + custom TOML themes + automatic light/dark detection,
   switchable live from a theme picker.
 - **Configurable** via `~/.config/revu/config.toml` and a repo-local
@@ -141,11 +143,15 @@ the CLI flag wins when both are set.
 | --- | --- | --- | --- |
 | `j` / `k`, arrows | scroll | `s` | toggle sidebar |
 | `Space` / `PgUp` | page down / up | `Tab` / `[` `]` | next / prev file |
-| `g` / `G` | top / bottom | `m` | cycle layout (auto/split/stack) |
+| `d` / `u` | half page down / up | `{` / `}` | prev / next hunk |
+| `g` / `G` | top / bottom | `Left` / `Right` | scroll horizontally |
+| `/`, then `n` / `N` | search; next / prev match | `m` | cycle layout (auto/split/stack/vertical) |
 | `n` | line numbers | `t` | theme picker |
 | `w` | line wrap | `e` | open file in `$EDITOR` |
-| `H` | hunk headers | `o` / `Enter` | toggle fold at cursor |
-| `c` | collapse all context | `O` / `C` | expand / collapse all folds |
+| `H` | hunk headers | `r` | reload diff from source |
+| `c` | collapse all context | `B` | blame gutter (working-tree diff) |
+| `o` / `Enter` | toggle fold at cursor | `O` / `C` | expand / collapse all folds |
+| mouse wheel | scroll | drag | select lines; release copies (OSC52) |
 | `?` | help | `Ctrl-Z` | suspend (resume with `fg`) |
 | `q` / `Esc` / `Ctrl-C` | quit | | |
 
