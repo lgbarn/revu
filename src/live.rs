@@ -22,11 +22,15 @@ pub enum DiffSource {
 /// The live-refresh policy for a [`DiffSource`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LivePolicy {
-    /// Whether the source can be re-fetched (the `r` reload and the future `L`
-    /// toggle / indicator key off this).
+    /// Whether the source can be re-fetched at all (the `r` reload keys off this).
     pub has_reload_source: bool,
     /// Whether live auto-refresh starts enabled for this source.
     pub default_on: bool,
+    /// Whether the `L` key can turn live auto-refresh on/off here. False for
+    /// sources that are re-fetchable for `r` but must never auto-poll (a commit,
+    /// stash, PR, or patch file), and for non-reloadable stdin. When false, the
+    /// status-bar indicator is greyed out and `L` is a no-op.
+    pub toggleable: bool,
 }
 
 impl DiffSource {
@@ -36,14 +40,22 @@ impl DiffSource {
             DiffSource::WorkingTree | DiffSource::Staged => LivePolicy {
                 has_reload_source: true,
                 default_on: true,
+                toggleable: true,
             },
-            DiffSource::TwoFile | DiffSource::Fixed => LivePolicy {
+            DiffSource::TwoFile => LivePolicy {
                 has_reload_source: true,
                 default_on: false,
+                toggleable: true,
+            },
+            DiffSource::Fixed => LivePolicy {
+                has_reload_source: true,
+                default_on: false,
+                toggleable: false,
             },
             DiffSource::Stdin => LivePolicy {
                 has_reload_source: false,
                 default_on: false,
+                toggleable: false,
             },
         }
     }
@@ -54,32 +66,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn working_tree_and_staged_poll_by_default() {
+    fn working_tree_and_staged_poll_by_default_and_toggle() {
         for source in [DiffSource::WorkingTree, DiffSource::Staged] {
             let p = source.live_policy();
             assert_eq!(
-                (p.default_on, p.has_reload_source),
-                (true, true),
-                "{source:?} should auto-poll and be re-fetchable"
+                (p.default_on, p.has_reload_source, p.toggleable),
+                (true, true, true),
+                "{source:?} should auto-poll, be re-fetchable, and toggle"
             );
         }
     }
 
     #[test]
-    fn reloadable_but_not_auto_polled_sources_are_opt_in() {
-        for source in [DiffSource::TwoFile, DiffSource::Fixed] {
-            let p = source.live_policy();
-            assert_eq!(
-                (p.default_on, p.has_reload_source),
-                (false, true),
-                "{source:?} should be re-fetchable but not auto-poll"
-            );
-        }
+    fn two_file_is_off_by_default_but_toggleable() {
+        // An arbitrary file pair can change, so `L` may enable it, but it does
+        // not auto-poll unprompted.
+        let p = DiffSource::TwoFile.live_policy();
+        assert_eq!(
+            (p.default_on, p.has_reload_source, p.toggleable),
+            (false, true, true)
+        );
     }
 
     #[test]
-    fn non_reloadable_source_neither_polls_nor_reloads() {
+    fn fixed_source_is_reloadable_but_never_live() {
+        // A commit / stash / PR / patch file is re-fetchable for `r`, but `L`
+        // must not enable auto-poll (network or immutable source).
+        let p = DiffSource::Fixed.live_policy();
+        assert_eq!(
+            (p.default_on, p.has_reload_source, p.toggleable),
+            (false, true, false)
+        );
+    }
+
+    #[test]
+    fn non_reloadable_source_neither_polls_reloads_nor_toggles() {
         let p = DiffSource::Stdin.live_policy();
-        assert_eq!((p.default_on, p.has_reload_source), (false, false));
+        assert_eq!(
+            (p.default_on, p.has_reload_source, p.toggleable),
+            (false, false, false)
+        );
     }
 }
