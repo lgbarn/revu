@@ -14,7 +14,6 @@ mod worddiff;
 use clap::Parser;
 
 use cli::{Cli, Command, StashCmd};
-use config::ConfigOverrides;
 
 fn main() {
     if let Err(e) = run() {
@@ -31,46 +30,20 @@ fn run() -> anyhow::Result<()> {
         Command::Diff {
             staged,
             exclude_untracked,
-            line_numbers,
-            no_line_numbers,
-            wrap,
-            no_wrap,
-            hunk_headers,
-            no_hunk_headers,
-            theme,
-            mode,
+            display,
             targets,
-        } => {
-            let overrides = ConfigOverrides {
-                theme,
-                mode,
-                line_numbers: flag_pair(line_numbers, no_line_numbers),
-                wrap_lines: flag_pair(wrap, no_wrap),
-                hunk_headers: flag_pair(hunk_headers, no_hunk_headers),
-            };
-            app::run_diff(staged, exclude_untracked, targets, overrides)
-        }
-        Command::Show { reff } => app::run_show(reff, ConfigOverrides::default()),
+        } => app::run_diff(staged, exclude_untracked, targets, display.into_overrides()),
+        Command::Show { reff, display } => app::run_show(reff, display.into_overrides()),
         Command::Stash {
-            cmd: StashCmd::Show { reff },
-        } => app::run_stash_show(reff, ConfigOverrides::default()),
-        Command::Difftool { left, right, path } => {
-            app::run_difftool(left, right, path, ConfigOverrides::default())
-        }
-        Command::Pager => pager::run_pager(),
-        Command::Patch { file } => pager::run_patch(file),
-    }
-}
-
-/// Collapse a `--flag` / `--no-flag` boolean pair into an `Option<bool>`:
-/// `Some(true)`/`Some(false)` when set, `None` when neither was passed (defer to
-/// config). clap's `overrides_with` guarantees at most one is true.
-fn flag_pair(yes: bool, no: bool) -> Option<bool> {
-    if yes {
-        Some(true)
-    } else if no {
-        Some(false)
-    } else {
-        None
+            cmd: StashCmd::Show { reff, display },
+        } => app::run_stash_show(reff, display.into_overrides()),
+        Command::Difftool {
+            left,
+            right,
+            path,
+            display,
+        } => app::run_difftool(left, right, path, display.into_overrides()),
+        Command::Pager { display } => pager::run_pager(display.into_overrides()),
+        Command::Patch { file, display } => pager::run_patch(file, display.into_overrides()),
     }
 }

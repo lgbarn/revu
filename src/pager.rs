@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::app;
+use crate::config::ConfigOverrides;
 
 /// Where a `patch` review should read its input from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub enum PatchSource {
 /// `revu pager`: render a diff piped on stdin (git's `core.pager`). If the
 /// input is not a diff, hand it to a plain-text pager so non-diff `git`
 /// output still paginates.
-pub fn run_pager() -> Result<()> {
+pub fn run_pager(overrides: ConfigOverrides) -> Result<()> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .read_to_end(&mut bytes)
@@ -26,15 +27,16 @@ pub fn run_pager() -> Result<()> {
     let text = String::from_utf8_lossy(&bytes);
 
     if looks_like_diff(&text) {
-        // pager/patch take no display flags; config + state.json still apply.
-        app::review_text(&text, &crate::config::ConfigOverrides::default())
+        // Display flags from the CLI apply to the diff view; config + state.json
+        // still layer underneath. Non-diff input goes to a plain pager below.
+        app::review_text(&text, &overrides)
     } else {
         spawn_text_pager(&bytes)
     }
 }
 
 /// `revu patch [file]`: review a patch file, or a piped diff with `-` / no arg.
-pub fn run_patch(file: Option<String>) -> Result<()> {
+pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()> {
     let text = match patch_source(file.as_deref()) {
         PatchSource::Stdin => {
             let mut s = String::new();
@@ -46,7 +48,7 @@ pub fn run_patch(file: Option<String>) -> Result<()> {
         PatchSource::File(path) => fs::read_to_string(&path)
             .with_context(|| format!("failed to read patch file `{path}`"))?,
     };
-    app::review_text(&text, &crate::config::ConfigOverrides::default())
+    app::review_text(&text, &overrides)
 }
 
 /// Decide where `patch` reads from. Pure so it can be tested without touching
