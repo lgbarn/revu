@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -22,6 +22,7 @@ use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::fold::{fold_at_cursor, FoldId};
 use crate::highlight::Highlighter;
+use crate::osc;
 use crate::render::{
     file_at_offset, file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions,
 };
@@ -398,6 +399,15 @@ fn run_loop(
     // each keystroke recomputes `search` so highlights and the counter update.
     let mut search: Option<Search> = None;
     let mut search_input: Option<String> = None;
+    // Mouse drag-selection (line granularity): `drag_anchor` is the line the
+    // press started on; `selection` is the inclusive line range to highlight;
+    // `copy_notice` is the transient "copied N lines" status after release.
+    let mut drag_anchor: Option<usize> = None;
+    // Whether a Drag event has occurred since the last press — a plain click
+    // (no drag) must not copy.
+    let mut dragged = false;
+    let mut selection: Option<(usize, usize)> = None;
+    let mut copy_notice: Option<String> = None;
 
     loop {
         // Resolve the effective layout from the configured mode + live width so a
@@ -471,6 +481,8 @@ fn run_loop(
             search_matches,
             search_current,
             search_status,
+            selection,
+            copy_notice: copy_notice.clone(),
         };
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
@@ -483,14 +495,60 @@ fn run_loop(
             continue;
         }
         let ev = event::read()?;
-        // Mouse wheel scrolls the diff vertically (capture is enabled in
-        // `init_review_terminal`). Other mouse events are ignored for now. Like
-        // the keyboard scroll keys, the wheel is inert while an overlay (theme
-        // selector / search prompt) is open, so it doesn't scroll underneath it.
+        // Mouse: the wheel scrolls; a left-button drag selects whole lines and
+        // copies them to the clipboard (OSC 52) on release. Both are inert while
+        // an overlay (theme selector / search prompt) is open. The main view's
+        // top is row 0, so a body row maps to line `offset + row`.
         if let Event::Mouse(me) = &ev {
             if !show_theme_selector && search_input.is_none() {
-                if let Some(new_offset) = wheel_scroll(me.kind, offset, WHEEL_LINES, max_offset) {
-                    offset = new_offset;
+                // Clamp a body row to a valid line index (rows >= view_h are the
+                // status bar). `view_h == 0` on the first frame -> no lines yet.
+                let line_at = |row: u16| {
+                    let r = (row as usize).min(view_h.saturating_sub(1) as usize);
+                    (offset as usize + r).min(lines.len().saturating_sub(1))
+                };
+                match me.kind {
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                        if let Some(n) = wheel_scroll(me.kind, offset, WHEEL_LINES, max_offset) {
+                            offset = n;
+                        }
+                    }
+                    // Drag-select is line-granular and unreliable while wrapping
+                    // (one logical line spans several rows), so it's disabled then.
+                    MouseEventKind::Down(MouseButton::Left) if !wrap && !lines.is_empty() => {
+                        copy_notice = None;
+                        if (me.row as usize) < view_h as usize {
+                            let l = line_at(me.row);
+                            drag_anchor = Some(l);
+                            dragged = false;
+                            selection = Some((l, l));
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some(a) = drag_anchor {
+                            dragged = true;
+                            selection = Some((a, line_at(me.row)));
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let was_dragging = drag_anchor.take().is_some();
+                        // Only an actual drag copies — a plain click must not
+                        // silently clobber the clipboard.
+                        if was_dragging && dragged {
+                            if let Some((s, e)) = selection {
+                                let text = osc::selected_lines_text(&line_texts, s, e);
+                                if !text.is_empty() {
+                                    let _ = write_osc52_copy(&text);
+                                    let n = s.max(e) - s.min(e) + 1;
+                                    let plural = if n == 1 { "" } else { "s" };
+                                    copy_notice =
+                                        Some(format!(" copied {n} line{plural} to clipboard "));
+                                }
+                            }
+                        }
+                        selection = None;
+                    }
+                    _ => {}
                 }
             }
             continue;
@@ -499,6 +557,11 @@ fn run_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Any key dismisses a transient copy notice / lingering selection
+            // and cancels an in-progress drag (e.g. toggling wrap mid-hold).
+            copy_notice = None;
+            selection = None;
+            drag_anchor = None;
             // When the theme selector is open it captures navigation/confirm keys
             // so they don't also scroll the diff. Enter applies the highlighted
             // theme live (swap the palette + rebuild the highlighter on its
@@ -823,6 +886,10 @@ struct ReviewFrame<'a> {
     search_current: Option<Match>,
     /// Prompt/counter text shown in place of the status bar while searching.
     search_status: Option<String>,
+    /// Inclusive line range currently drag-selected, reversed for highlight.
+    selection: Option<(usize, usize)>,
+    /// Transient "copied N lines" notice shown in the status bar after a copy.
+    copy_notice: Option<String>,
 }
 
 /// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
@@ -849,7 +916,7 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     // ponytail: clone per frame is wasteful for huge diffs; revisit if it ever
     // shows up in a profile. Fine for interactive review sizes. When a search is
     // active, overlay the match highlight on the (few) matched lines only.
-    let display_lines: Vec<Line<'static>> = if v.search_matches.is_empty() {
+    let mut display_lines: Vec<Line<'static>> = if v.search_matches.is_empty() {
         v.lines.to_vec()
     } else {
         let matched_rows: HashSet<usize> = v.search_matches.iter().map(|m| m.line).collect();
@@ -865,6 +932,18 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
             })
             .collect()
     };
+    // Reverse the drag-selected line range so the user sees what will be copied.
+    if let Some((a, b)) = v.selection {
+        if !display_lines.is_empty() {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let hi = hi.min(display_lines.len() - 1);
+            for line in display_lines.iter_mut().take(hi + 1).skip(lo) {
+                for span in line.spans.iter_mut() {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
+            }
+        }
+    }
     let mut paragraph = Paragraph::new(display_lines).scroll((v.offset, v.h_offset));
     if v.wrap {
         // `trim: false` keeps leading indentation when wrapping.
@@ -873,8 +952,9 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     frame.render_widget(paragraph, main);
 
     let max_off = v.total.saturating_sub(main.height);
-    if let Some(text) = &v.search_status {
-        // The search prompt/counter takes over the status line while searching.
+    if let Some(text) = v.search_status.as_ref().or(v.copy_notice.as_ref()) {
+        // The search prompt/counter (or, after a copy, the copy notice) takes
+        // over the status line.
         frame.render_widget(
             Paragraph::new(Line::from(text.clone()))
                 .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -1000,6 +1080,16 @@ fn wheel_scroll(kind: MouseEventKind, offset: u16, step: u16, max_offset: u16) -
         MouseEventKind::ScrollUp => Some(offset.saturating_sub(step)),
         _ => None,
     }
+}
+
+/// Write the OSC 52 clipboard-copy escape for `text` straight to the terminal
+/// (out of band — ratatui never sees it). Best-effort: a write failure just
+/// means the copy didn't take, which the caller already treats as non-fatal.
+fn write_osc52_copy(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(osc::osc52_copy(text).as_bytes())?;
+    out.flush()
 }
 
 /// Map a selected file index to a clamped scroll offset for the main view.
@@ -1257,6 +1347,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "",
         "  e   open file in $EDITOR",
         "  r   reload the diff from its source",
+        "  drag   select lines; release copies (OSC52)",
         "  Ctrl-Z suspend  Ctrl-C quit",
         "",
         &theme_line,
@@ -1431,6 +1522,8 @@ index 5555555..6666666 100644
             search_matches: &[],
             search_current: None,
             search_status: None,
+            selection: None,
+            copy_notice: None,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -1669,6 +1762,8 @@ index 5555555..6666666 100644
             search_matches: &[],
             search_current: None,
             search_status: None,
+            selection: None,
+            copy_notice: None,
         };
 
         let backend = TestBackend::new(130, 20);
