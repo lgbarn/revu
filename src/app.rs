@@ -776,6 +776,10 @@ fn run_loop(
                     if let Some(fetch) = &reload {
                         if let Ok(text) = fetch() {
                             model = build_model(&text);
+                            // Track the reloaded text so the next live-poll's
+                            // compare-before-rebuild sees it unchanged and skips
+                            // a redundant fetch+rebuild right after `r`.
+                            current_text = text;
                             summaries = file_summaries(&model);
                             file_count = model.files.len();
                             offset = 0;
