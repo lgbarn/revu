@@ -398,10 +398,14 @@ fn run_loop(
         }
         let ev = event::read()?;
         // Mouse wheel scrolls the diff vertically (capture is enabled in
-        // `init_review_terminal`). Other mouse events are ignored for now.
+        // `init_review_terminal`). Other mouse events are ignored for now. Like
+        // the keyboard scroll keys, the wheel is inert while an overlay (theme
+        // selector / search prompt) is open, so it doesn't scroll underneath it.
         if let Event::Mouse(me) = &ev {
-            if let Some(new_offset) = wheel_scroll(me.kind, offset, WHEEL_LINES, max_offset) {
-                offset = new_offset;
+            if !show_theme_selector && search_input.is_none() {
+                if let Some(new_offset) = wheel_scroll(me.kind, offset, WHEEL_LINES, max_offset) {
+                    offset = new_offset;
+                }
             }
             continue;
         }
