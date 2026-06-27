@@ -713,6 +713,15 @@ fn run_loop(
                             h_offset = 0;
                             expanded_folds.clear();
                             search = None;
+                            // The new model may have a different file set/order,
+                            // so the old blame cache (keyed by file index) is
+                            // stale — refetch against the new files when blame is
+                            // on, else just drop it.
+                            blame_cache = if blame_on {
+                                fetch_all_blame(&summaries)
+                            } else {
+                                HashMap::new()
+                            };
                             needs_render = true;
                         }
                     }
@@ -813,12 +822,7 @@ fn run_loop(
                 KeyCode::Char('B') if blame_enabled => {
                     blame_on = !blame_on;
                     if blame_on && blame_cache.is_empty() {
-                        let adapter = GitAdapter::new();
-                        for (idx, summary) in summaries.iter().enumerate() {
-                            if let Ok(porcelain) = adapter.blame(None, &summary.path) {
-                                blame_cache.insert(idx, crate::blame::parse_blame(&porcelain));
-                            }
-                        }
+                        blame_cache = fetch_all_blame(&summaries);
                     }
                 }
                 _ => {}
@@ -966,8 +970,10 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     // Optional blame gutter: a fixed-width column at the left of the main area,
     // scrolled in sync with the diff so each row lines up. Stack layout only
     // (split/vertical leave `blame_keys` empty, so this is skipped there).
+    // Suppressed while wrapping: a wrapped logical line spans several terminal
+    // rows, but the gutter is one row per logical line, so it can't stay aligned.
     const BLAME_W: u16 = 18;
-    let main = if v.blame_on && !v.blame_keys.is_empty() && main.width > BLAME_W + 10 {
+    let main = if v.blame_on && !v.wrap && !v.blame_keys.is_empty() && main.width > BLAME_W + 10 {
         let cols =
             Layout::horizontal([Constraint::Length(BLAME_W), Constraint::Min(0)]).split(main);
         let gutter = blame_gutter_lines(v, BLAME_W as usize);
@@ -1154,6 +1160,20 @@ fn write_osc52_copy(text: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout();
     out.write_all(osc::osc52_copy(text).as_bytes())?;
     out.flush()
+}
+
+/// Fetch `git blame` (working tree) for every file in `summaries`, keyed by file
+/// index. A file whose blame fails (e.g. revu launched from a subdir) is simply
+/// omitted, so its gutter renders blank rather than wrong.
+fn fetch_all_blame(summaries: &[FileSummary]) -> HashMap<usize, Vec<crate::blame::BlameLine>> {
+    let adapter = GitAdapter::new();
+    let mut cache = HashMap::new();
+    for (idx, summary) in summaries.iter().enumerate() {
+        if let Ok(porcelain) = adapter.blame(None, &summary.path) {
+            cache.insert(idx, crate::blame::parse_blame(&porcelain));
+        }
+    }
+    cache
 }
 
 /// One `width`-column blame cell for rendered row `row`: `author age`, dim, or
