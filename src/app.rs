@@ -403,6 +403,9 @@ fn run_loop(
     // press started on; `selection` is the inclusive line range to highlight;
     // `copy_notice` is the transient "copied N lines" status after release.
     let mut drag_anchor: Option<usize> = None;
+    // Whether a Drag event has occurred since the last press — a plain click
+    // (no drag) must not copy.
+    let mut dragged = false;
     let mut selection: Option<(usize, usize)> = None;
     let mut copy_notice: Option<String> = None;
 
@@ -517,17 +520,21 @@ fn run_loop(
                         if (me.row as usize) < view_h as usize {
                             let l = line_at(me.row);
                             drag_anchor = Some(l);
+                            dragged = false;
                             selection = Some((l, l));
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some(a) = drag_anchor {
+                            dragged = true;
                             selection = Some((a, line_at(me.row)));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let was_dragging = drag_anchor.take().is_some();
-                        if was_dragging {
+                        // Only an actual drag copies — a plain click must not
+                        // silently clobber the clipboard.
+                        if was_dragging && dragged {
                             if let Some((s, e)) = selection {
                                 let text = osc::selected_lines_text(&line_texts, s, e);
                                 if !text.is_empty() {
@@ -538,8 +545,8 @@ fn run_loop(
                                         Some(format!(" copied {n} line{plural} to clipboard "));
                                 }
                             }
-                            selection = None;
                         }
+                        selection = None;
                     }
                     _ => {}
                 }
@@ -550,9 +557,11 @@ fn run_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            // Any key dismisses a transient copy notice / lingering selection.
+            // Any key dismisses a transient copy notice / lingering selection
+            // and cancels an in-progress drag (e.g. toggling wrap mid-hold).
             copy_notice = None;
             selection = None;
+            drag_anchor = None;
             // When the theme selector is open it captures navigation/confirm keys
             // so they don't also scroll the diff. Enter applies the highlighted
             // theme live (swap the palette + rebuild the highlighter on its
