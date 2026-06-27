@@ -49,6 +49,13 @@ pub struct DisplayFlags {
     #[arg(long = "no-hunk-headers", overrides_with = "hunk_headers")]
     no_hunk_headers: bool,
 
+    /// Auto-refresh the diff while editing (overrides config)
+    #[arg(long = "live", overrides_with = "no_live")]
+    live: bool,
+    /// Disable live auto-refresh (overrides config)
+    #[arg(long = "no-live", overrides_with = "live")]
+    no_live: bool,
+
     /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
     #[arg(long)]
     theme: Option<String>,
@@ -67,6 +74,7 @@ impl DisplayFlags {
             line_numbers: flag_pair(self.line_numbers, self.no_line_numbers),
             wrap_lines: flag_pair(self.wrap, self.no_wrap),
             hunk_headers: flag_pair(self.hunk_headers, self.no_hunk_headers),
+            live: flag_pair(self.live, self.no_live),
         }
     }
 }
@@ -235,6 +243,32 @@ mod tests {
                 assert_eq!(ov.line_numbers, Some(false));
             }
             _ => panic!("expected Show"),
+        }
+    }
+
+    #[test]
+    fn live_flags_resolve_to_override() {
+        // --no-live -> Some(false).
+        let cli = Cli::parse_from(["revu", "diff", "--no-live"]);
+        match cli.command {
+            Command::Diff { display, .. } => {
+                assert_eq!(display.into_overrides().live, Some(false));
+            }
+            _ => panic!("expected Diff"),
+        }
+        // --live -> Some(true).
+        let cli = Cli::parse_from(["revu", "diff", "--live"]);
+        match cli.command {
+            Command::Diff { display, .. } => {
+                assert_eq!(display.into_overrides().live, Some(true));
+            }
+            _ => panic!("expected Diff"),
+        }
+        // Neither -> None (defer to config).
+        let cli = Cli::parse_from(["revu", "diff"]);
+        match cli.command {
+            Command::Diff { display, .. } => assert_eq!(display.into_overrides().live, None),
+            _ => panic!("expected Diff"),
         }
     }
 

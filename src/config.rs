@@ -19,6 +19,10 @@ use serde::Deserialize;
 use crate::vcs::git::GitAdapter;
 use crate::vcs::VcsAdapter;
 
+/// Default live auto-refresh cadence in milliseconds (1s). The single source of
+/// truth for the `live_interval_ms` default.
+pub const DEFAULT_LIVE_INTERVAL_MS: u64 = 1000;
+
 /// Fully-resolved configuration the rest of the app consumes.
 ///
 /// `theme`, `mode`, `transparent_background`, and `custom_theme` are parsed and
@@ -45,6 +49,13 @@ pub struct Config {
     pub vcs: Option<String>,
     /// Custom theme definition. Parsed only; applied in #9.
     pub custom_theme: Option<CustomTheme>,
+    /// Auto-refresh the diff while editing (working-tree/staged sources only).
+    /// Master switch; the per-source default still decides which sources poll.
+    /// Default true.
+    pub live: bool,
+    /// Live auto-refresh cadence in milliseconds. Default
+    /// [`DEFAULT_LIVE_INTERVAL_MS`].
+    pub live_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -58,6 +69,8 @@ impl Default for Config {
             transparent_background: false,
             vcs: None,
             custom_theme: None,
+            live: true,
+            live_interval_ms: DEFAULT_LIVE_INTERVAL_MS,
         }
     }
 }
@@ -95,6 +108,8 @@ struct PartialConfig {
     #[serde(alias = "transparentBackground")]
     transparent_background: Option<bool>,
     custom_theme: Option<CustomTheme>,
+    live: Option<bool>,
+    live_interval_ms: Option<u64>,
 }
 
 /// CLI-supplied overrides, applied last (highest precedence). A `None` field
@@ -106,6 +121,7 @@ pub struct ConfigOverrides {
     pub line_numbers: Option<bool>,
     pub wrap_lines: Option<bool>,
     pub hunk_headers: Option<bool>,
+    pub live: Option<bool>,
 }
 
 impl Config {
@@ -157,6 +173,9 @@ pub fn resolve(
     if let Some(v) = overrides.hunk_headers {
         cfg.hunk_headers = v;
     }
+    if let Some(v) = overrides.live {
+        cfg.live = v;
+    }
 
     Ok(cfg)
 }
@@ -186,6 +205,12 @@ fn apply_partial(cfg: &mut Config, p: PartialConfig) {
     }
     if let Some(v) = p.custom_theme {
         cfg.custom_theme = Some(v);
+    }
+    if let Some(v) = p.live {
+        cfg.live = v;
+    }
+    if let Some(v) = p.live_interval_ms {
+        cfg.live_interval_ms = v;
     }
 }
 
@@ -226,6 +251,28 @@ mod tests {
         assert!(!cfg.wrap_lines);
         assert!(cfg.hunk_headers);
         assert!(!cfg.transparent_background);
+        // Live auto-refresh defaults: on, 1s cadence.
+        assert!(cfg.live);
+        assert_eq!(cfg.live_interval_ms, DEFAULT_LIVE_INTERVAL_MS);
+    }
+
+    #[test]
+    fn live_settings_layer_and_override() {
+        // Global sets both; repo flips the interval; CLI forces live off last.
+        let global = "live = true\nlive_interval_ms = 2000\n";
+        let repo = "live_interval_ms = 500\n";
+        let cfg = resolve(Some(global), Some(repo), &ConfigOverrides::default()).unwrap();
+        assert!(cfg.live, "repo did not touch live, global's true stands");
+        assert_eq!(cfg.live_interval_ms, 500, "repo overrides global interval");
+
+        // --no-live (overrides.live = Some(false)) beats the file layers.
+        let overrides = ConfigOverrides {
+            live: Some(false),
+            ..Default::default()
+        };
+        let cfg = resolve(Some(global), Some(repo), &overrides).unwrap();
+        assert!(!cfg.live, "CLI --no-live wins over config");
+        assert_eq!(cfg.live_interval_ms, 500);
     }
 
     #[test]
