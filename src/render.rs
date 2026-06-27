@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::diff::{DiffLine, DiffModel, LineKind};
+use crate::diff::{DiffLine, DiffModel, FileDiff, Hunk, LineKind};
 use crate::fold::{compute_hunk_folds, is_expanded, FoldId};
 use crate::highlight::Highlighter;
 use crate::theme::Theme;
@@ -272,31 +272,14 @@ fn stack_rows(
         file_starts.push(out.len());
         // Folds are numbered per file, sequentially across its hunks.
         let mut fold_index = 0usize;
-        out.push(Line::from(Span::styled(
-            format!("── {} ", file.path),
-            Style::default()
-                .fg(theme.file_header)
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        if file.binary {
-            out.push(Line::from(Span::styled(
-                "  (binary file differs)",
-                Style::default().fg(theme.gutter),
-            )));
-        }
+        push_file_header(&mut out, file, theme);
 
         // Resolve the file's syntax once; unknown extensions fall back to plain
         // text inside `syntax_for_path`.
         let syntax = highlighter.syntax_for_path(&file.path);
 
         for hunk in &file.hunks {
-            if opts.hunk_headers {
-                out.push(Line::from(Span::styled(
-                    hunk.header.clone(),
-                    Style::default().fg(theme.hunk_header),
-                )));
-            }
+            push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the hunk header.
             // `None` (an unparseable header) renders blank gutters for the whole
@@ -480,29 +463,12 @@ fn split_rows(
     for file in &model.files {
         // Same file_starts contract as stack: the header row index per file.
         file_starts.push(out.len());
-        out.push(Line::from(Span::styled(
-            format!("── {} ", file.path),
-            Style::default()
-                .fg(theme.file_header)
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        if file.binary {
-            out.push(Line::from(Span::styled(
-                "  (binary file differs)",
-                Style::default().fg(theme.gutter),
-            )));
-        }
+        push_file_header(&mut out, file, theme);
 
         let syntax = highlighter.syntax_for_path(&file.path);
 
         for hunk in &file.hunks {
-            if opts.hunk_headers {
-                out.push(Line::from(Span::styled(
-                    hunk.header.clone(),
-                    Style::default().fg(theme.hunk_header),
-                )));
-            }
+            push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the header. Old
             // advances on context+removes, new on context+adds.
@@ -855,6 +821,39 @@ fn styled_segment(
         _ => base,
     };
     Span::styled(text.to_string(), style)
+}
+
+/// Emit a file's header line (and a marker line for binary files). Shared by the
+/// stack and split layouts so the header format has one source of truth.
+fn push_file_header(out: &mut Vec<Line<'static>>, file: &FileDiff, theme: &Theme) {
+    out.push(Line::from(Span::styled(
+        format!("── {} ", file.path),
+        Style::default()
+            .fg(theme.file_header)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if file.binary {
+        out.push(Line::from(Span::styled(
+            "  (binary file differs)",
+            Style::default().fg(theme.gutter),
+        )));
+    }
+}
+
+/// Emit a hunk's `@@` header line when hunk headers are enabled. Shared by both
+/// layouts.
+fn push_hunk_header(
+    out: &mut Vec<Line<'static>>,
+    hunk: &Hunk,
+    opts: &RenderOptions,
+    theme: &Theme,
+) {
+    if opts.hunk_headers {
+        out.push(Line::from(Span::styled(
+            hunk.header.clone(),
+            Style::default().fg(theme.hunk_header),
+        )));
+    }
 }
 
 #[cfg(test)]
