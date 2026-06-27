@@ -41,6 +41,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  docs:
+    name: doc build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Fails on broken intra-doc links and other rustdoc warnings, so the
+      # published API docs can't silently rot.
+      - name: Build API docs
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   test:
     name: test (incl. no-network/no-telemetry guard)
     runs-on: ubuntu-latest

@@ -3,7 +3,7 @@
 //! Pure over the model: given a [`DiffModel`], pair each removed line in a hunk
 //! with the correspondingly-positioned added line and compute, via word-level
 //! diffing, which byte ranges of each changed. Those ranges land in
-//! [`DiffLine::emphasis`] so the renderer can highlight just the words that
+//! [`crate::diff::DiffLine::emphasis`] so the renderer can highlight just the words that
 //! actually changed (not the whole line). No I/O, so it is exhaustively
 //! testable without git or a terminal.
 
@@ -15,7 +15,7 @@ use crate::diff::{DiffModel, Hunk, LineKind};
 /// type of [`crate::diff::DiffLine::emphasis`].
 pub type ByteRanges = Vec<(usize, usize)>;
 
-/// Fill [`DiffLine::emphasis`] across every hunk of `model` with word-level
+/// Fill [`crate::diff::DiffLine::emphasis`] across every hunk of `model` with word-level
 /// changed byte ranges. Idempotent-ish: it overwrites any existing emphasis.
 pub fn compute_word_emphasis(model: &mut DiffModel) {
     for file in &mut model.files {

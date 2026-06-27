@@ -1,3 +1,7 @@
+//! Git implementation of the `VcsAdapter` trait: builds and runs `git`
+//! subprocesses (always via argument vectors, never a shell string) to produce
+//! the diff text that the rest of revu parses and renders.
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -11,7 +15,7 @@ use super::{DiffOptions, VcsAdapter};
 pub struct GitAdapter {
     program: String,
     /// Working directory to run git in. `None` uses the process CWD; tests set
-    /// it to a fixture repo via [`GitAdapter::in_dir`].
+    /// it to a fixture repo via `GitAdapter::in_dir` (test-only).
     cwd: Option<PathBuf>,
 }
 
