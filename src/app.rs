@@ -254,6 +254,8 @@ fn run_loop(
     // Plain text of each rendered line, rebuilt alongside `lines`, for search.
     let mut line_texts: Vec<String> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::new();
+    // Row where each hunk begins, for `{`/`}` navigation; rebuilt with `lines`.
+    let mut hunk_starts: Vec<usize> = Vec::new();
     // Row -> FoldId for the fold bars in the current render, ascending by row.
     // Rebuilt every render alongside `lines`; the `o`/Enter toggle reads it.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
@@ -273,6 +275,12 @@ fn run_loop(
     let mut cur_mode: Option<LayoutMode> = None;
     let mut cur_width: u16 = 0;
     let mut needs_render = true;
+    // Horizontal scroll offset (columns) for the left/right arrows when not
+    // wrapping. ponytail: a fixed cap and step, not the measured longest line —
+    // far cheaper and indistinguishable in use; revisit if a diff needs more.
+    let mut h_offset: u16 = 0;
+    const H_STEP: u16 = 8;
+    const H_MAX: u16 = 512;
     // Active search over the rendered lines (matches + cursor), or `None`. While
     // `search_input` is `Some`, the user is live-typing a query in the prompt;
     // each keystroke recomputes `search` so highlights and the counter update.
@@ -304,6 +312,7 @@ fn run_loop(
             lines = r.lines;
             line_texts = lines.iter().map(line_plain_text).collect();
             file_starts = r.file_starts;
+            hunk_starts = r.hunk_starts;
             fold_bars = r.fold_bars;
             cur_mode = Some(eff_mode);
             cur_width = main_width;
@@ -337,6 +346,7 @@ fn run_loop(
             file_count,
             selected_file: active_file,
             offset,
+            h_offset,
             total,
             wrap,
             sidebar_visible,
@@ -431,13 +441,23 @@ fn run_loop(
                 }
                 continue;
             }
-            // Scroll + file navigation are pure offset math, extracted into
+            // Scroll + file/hunk navigation are pure offset math, extracted into
             // `scroll_offset` so they can be unit-tested. Handle them first;
             // every other key falls through to the match below.
-            if let Some(new_offset) =
-                scroll_offset(key.code, offset, page, max_offset, &file_starts)
-            {
+            if let Some(new_offset) = scroll_offset(
+                key.code,
+                offset,
+                page,
+                max_offset,
+                &file_starts,
+                &hunk_starts,
+            ) {
                 offset = new_offset;
+                continue;
+            }
+            // Horizontal scroll (left/right arrows) when not wrapping.
+            if let Some(nh) = h_scroll_offset(key.code, h_offset, H_STEP, H_MAX, wrap) {
+                h_offset = nh;
                 continue;
             }
             match key.code {
@@ -635,6 +655,8 @@ struct ReviewFrame<'a> {
     file_count: usize,
     selected_file: usize,
     offset: u16,
+    /// Horizontal scroll offset in columns (0 unless the user arrowed sideways).
+    h_offset: u16,
     /// Total rendered line count (already clamped to `u16::MAX`).
     total: u16,
     wrap: bool,
@@ -694,7 +716,7 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
             })
             .collect()
     };
-    let mut paragraph = Paragraph::new(display_lines).scroll((v.offset, 0));
+    let mut paragraph = Paragraph::new(display_lines).scroll((v.offset, v.h_offset));
     if v.wrap {
         // `trim: false` keeps leading indentation when wrapping.
         paragraph = paragraph.wrap(Wrap { trim: false });
@@ -743,12 +765,19 @@ fn scroll_offset(
     page: u16,
     max_offset: u16,
     file_starts: &[usize],
+    hunk_starts: &[usize],
 ) -> Option<u16> {
+    // Half a page (>= 1) for the `d`/`u` keys.
+    let half = (page / 2).max(1);
     let new_offset = match key {
         KeyCode::Down | KeyCode::Char('j') => (offset + 1).min(max_offset),
         KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
         KeyCode::PageDown | KeyCode::Char(' ') => (offset + page).min(max_offset),
         KeyCode::PageUp => offset.saturating_sub(page),
+        // Half-page steps (vim `Ctrl-D`/`Ctrl-U`, here plain `d`/`u`).
+        KeyCode::Char('d') => (offset + half).min(max_offset),
+        KeyCode::Char('u') => offset.saturating_sub(half),
+        // `g`/Home jump to the top; pressing `g` twice (vim `gg`) lands there too.
         KeyCode::Home | KeyCode::Char('g') => 0,
         KeyCode::End | KeyCode::Char('G') => max_offset,
         KeyCode::Tab | KeyCode::Char(']') => {
@@ -767,9 +796,43 @@ fn scroll_offset(
             let target = current.saturating_sub(1);
             file_to_offset(file_starts, target, max_offset)
         }
+        // `{`/`}` hop between hunks, mirroring `[`/`]` for files. The `starts`
+        // helpers are generic over any ascending row list, so hunk_starts reuses
+        // file_at_offset / file_to_offset directly.
+        KeyCode::Char('}') => {
+            if hunk_starts.is_empty() {
+                return None;
+            }
+            let current = file_at_offset(hunk_starts, offset as usize);
+            let target = (current + 1).min(hunk_starts.len() - 1);
+            file_to_offset(hunk_starts, target, max_offset)
+        }
+        KeyCode::Char('{') => {
+            if hunk_starts.is_empty() {
+                return None;
+            }
+            let current = file_at_offset(hunk_starts, offset as usize);
+            let target = current.saturating_sub(1);
+            file_to_offset(hunk_starts, target, max_offset)
+        }
         _ => return None,
     };
     Some(new_offset)
+}
+
+/// New horizontal scroll offset for the left/right arrows, or `None` when `key`
+/// isn't one (or wrapping is on, where horizontal scrolling is meaningless).
+/// Pure so it is unit-testable. Right advances by `step` up to `max`; left backs
+/// off toward 0.
+fn h_scroll_offset(key: KeyCode, h: u16, step: u16, max: u16, wrap: bool) -> Option<u16> {
+    if wrap {
+        return None;
+    }
+    match key {
+        KeyCode::Right => Some((h + step).min(max)),
+        KeyCode::Left => Some(h.saturating_sub(step)),
+        _ => None,
+    }
 }
 
 /// Map a selected file index to a clamped scroll offset for the main view.
@@ -1000,11 +1063,14 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  k / Up        scroll up",
         "  Space / PgDn  page down",
         "  PgUp          page up",
+        "  d / u         half page down / up",
+        "  Left / Right  scroll horizontally",
         "  g / Home      jump to top",
         "  G / End       jump to bottom",
         "",
         "  Tab / ]       next file",
         "  Shift-Tab / [ previous file",
+        "  } / {         next / prev hunk",
         "  s             toggle sidebar",
         "",
         "  /   search   (n / N next / prev)",
@@ -1182,6 +1248,7 @@ index 5555555..6666666 100644
             file_count: model.files.len(),
             selected_file,
             offset,
+            h_offset: 0,
             total: rendered.lines.len() as u16,
             wrap: false,
             sidebar_visible: true,
@@ -1233,35 +1300,105 @@ index 5555555..6666666 100644
     #[test]
     fn scroll_offset_line_and_page_movement() {
         let fs: &[usize] = &[];
+        let hs: &[usize] = &[];
         // Down/j increments and clamps at max_offset (at max, stays).
-        assert_eq!(scroll_offset(KeyCode::Char('j'), 0, 10, 5, fs), Some(1));
-        assert_eq!(scroll_offset(KeyCode::Down, 5, 10, 5, fs), Some(5));
+        assert_eq!(scroll_offset(KeyCode::Char('j'), 0, 10, 5, fs, hs), Some(1));
+        assert_eq!(scroll_offset(KeyCode::Down, 5, 10, 5, fs, hs), Some(5));
         // Up/k saturates at 0.
-        assert_eq!(scroll_offset(KeyCode::Char('k'), 0, 10, 5, fs), Some(0));
+        assert_eq!(scroll_offset(KeyCode::Char('k'), 0, 10, 5, fs, hs), Some(0));
         // Page down/up by `page`, clamped.
-        assert_eq!(scroll_offset(KeyCode::Char(' '), 0, 4, 100, fs), Some(4));
-        assert_eq!(scroll_offset(KeyCode::PageUp, 3, 10, 100, fs), Some(0));
-        // Home/g -> 0, End/G -> max_offset.
-        assert_eq!(scroll_offset(KeyCode::Char('g'), 50, 10, 80, fs), Some(0));
-        assert_eq!(scroll_offset(KeyCode::Char('G'), 0, 10, 80, fs), Some(80));
+        assert_eq!(
+            scroll_offset(KeyCode::Char(' '), 0, 4, 100, fs, hs),
+            Some(4)
+        );
+        assert_eq!(scroll_offset(KeyCode::PageUp, 3, 10, 100, fs, hs), Some(0));
+        // Half-page d/u move by page/2 (>= 1), clamped.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('d'), 0, 10, 100, fs, hs),
+            Some(5)
+        );
+        assert_eq!(
+            scroll_offset(KeyCode::Char('u'), 4, 10, 100, fs, hs),
+            Some(0)
+        );
+        // page/2 floors to 1 so `d` always advances.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('d'), 0, 1, 100, fs, hs),
+            Some(1)
+        );
+        // Home/g -> 0 (vim `gg` lands there too), End/G -> max_offset.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('g'), 50, 10, 80, fs, hs),
+            Some(0)
+        );
+        assert_eq!(
+            scroll_offset(KeyCode::Char('G'), 0, 10, 80, fs, hs),
+            Some(80)
+        );
         // A non-scroll key returns None so the caller handles it.
-        assert_eq!(scroll_offset(KeyCode::Char('q'), 0, 10, 80, fs), None);
+        assert_eq!(scroll_offset(KeyCode::Char('x'), 0, 10, 80, fs, hs), None);
     }
 
     #[test]
     fn scroll_offset_file_navigation() {
         // Three files starting at rows 0, 10, 25.
         let fs: &[usize] = &[0, 10, 25];
+        let hs: &[usize] = &[];
         // Tab from the first file jumps to the second file's start.
-        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, fs), Some(10));
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, fs, hs), Some(10));
         // Tab past the last file clamps to the last file's start.
-        assert_eq!(scroll_offset(KeyCode::Char(']'), 25, 10, 100, fs), Some(25));
+        assert_eq!(
+            scroll_offset(KeyCode::Char(']'), 25, 10, 100, fs, hs),
+            Some(25)
+        );
         // BackTab from the second file goes to the first.
-        assert_eq!(scroll_offset(KeyCode::BackTab, 10, 10, 100, fs), Some(0));
+        assert_eq!(
+            scroll_offset(KeyCode::BackTab, 10, 10, 100, fs, hs),
+            Some(0)
+        );
         // file_to_offset clamps the target to max_offset.
-        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 5, fs), Some(5));
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 5, fs, hs), Some(5));
         // With no files, Tab/BackTab are not handled here (return None).
-        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, &[]), None);
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, &[], hs), None);
+    }
+
+    #[test]
+    fn scroll_offset_hunk_navigation() {
+        let fs: &[usize] = &[0];
+        // Two hunks starting at rows 3 and 12.
+        let hs: &[usize] = &[3, 12];
+        // `}` from before the second hunk jumps to it.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('}'), 3, 10, 100, fs, hs),
+            Some(12)
+        );
+        // `}` past the last hunk clamps to it.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('}'), 12, 10, 100, fs, hs),
+            Some(12)
+        );
+        // `{` steps back to the previous hunk.
+        assert_eq!(
+            scroll_offset(KeyCode::Char('{'), 12, 10, 100, fs, hs),
+            Some(3)
+        );
+        // With no hunks, `{`/`}` are not handled (return None).
+        assert_eq!(scroll_offset(KeyCode::Char('}'), 0, 10, 100, fs, &[]), None);
+    }
+
+    #[test]
+    fn h_scroll_offset_moves_within_bounds_and_respects_wrap() {
+        // Right advances by step, clamped at max; Left backs off toward 0.
+        assert_eq!(h_scroll_offset(KeyCode::Right, 0, 8, 512, false), Some(8));
+        assert_eq!(
+            h_scroll_offset(KeyCode::Right, 510, 8, 512, false),
+            Some(512)
+        );
+        assert_eq!(h_scroll_offset(KeyCode::Left, 4, 8, 512, false), Some(0));
+        // Wrapping disables horizontal scroll.
+        assert_eq!(h_scroll_offset(KeyCode::Right, 0, 8, 512, true), None);
+        // Other keys are not horizontal-scroll keys.
+        assert_eq!(h_scroll_offset(KeyCode::Char('j'), 0, 8, 512, false), None);
     }
 
     #[test]
@@ -1316,6 +1453,7 @@ index 5555555..6666666 100644
             file_count: model.files.len(),
             selected_file: 0,
             offset: 0,
+            h_offset: 0,
             total: rendered.lines.len() as u16,
             wrap: false,
             sidebar_visible,
