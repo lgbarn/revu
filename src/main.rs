@@ -38,9 +38,16 @@ fn run() -> anyhow::Result<()> {
         Command::Diff {
             staged,
             exclude_untracked,
+            pr,
             display,
             targets,
-        } => app::run_diff(staged, exclude_untracked, targets, display.into_overrides()),
+        } => app::run_diff(
+            staged,
+            exclude_untracked,
+            pr,
+            targets,
+            display.into_overrides(),
+        ),
         Command::Show { reff, display } => app::run_show(reff, display.into_overrides()),
         Command::Stash {
             cmd: StashCmd::Show { reff, display },

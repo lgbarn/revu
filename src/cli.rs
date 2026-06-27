@@ -95,6 +95,12 @@ pub enum Command {
         #[arg(long)]
         exclude_untracked: bool,
 
+        /// Review a GitHub pull request by number, via `gh pr diff <n>`. revu
+        /// makes no network call itself — the fetch is delegated to your
+        /// already-authenticated `gh`. Ignores the working tree and other flags.
+        #[arg(long, value_name = "N")]
+        pr: Option<u64>,
+
         #[command(flatten)]
         display: DisplayFlags,
 
@@ -162,6 +168,21 @@ pub enum StashCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_diff_pr_number() {
+        let cli = Cli::parse_from(["revu", "diff", "--pr", "123"]);
+        match cli.command {
+            Command::Diff { pr, .. } => assert_eq!(pr, Some(123)),
+            _ => panic!("expected Diff"),
+        }
+        // Absent by default.
+        let cli = Cli::parse_from(["revu", "diff"]);
+        match cli.command {
+            Command::Diff { pr, .. } => assert!(pr.is_none()),
+            _ => panic!("expected Diff"),
+        }
+    }
 
     #[test]
     fn parses_difftool_with_path() {
