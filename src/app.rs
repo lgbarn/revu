@@ -408,6 +408,13 @@ fn run_loop(
                         }
                         recompute = true;
                     }
+                    // Ctrl-C and Ctrl-Z keep working from the prompt rather than
+                    // being typed into the query (the prompt must not trap them).
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    #[cfg(unix)]
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        suspend_and_resume(terminal);
+                    }
                     KeyCode::Char(c) => {
                         if let Some(b) = search_input.as_mut() {
                             b.push(c);
@@ -419,9 +426,7 @@ fn run_loop(
                 if recompute {
                     let q = search_input.clone().unwrap_or_default();
                     let s = Search::new(q, &line_texts);
-                    if let Some(m) = s.current_match() {
-                        offset = match_offset(m, max_offset);
-                    }
+                    jump_to_match(&s, &mut offset, max_offset);
                     search = Some(s);
                 }
                 continue;
@@ -476,9 +481,7 @@ fn run_loop(
                 KeyCode::Char('N') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.prev();
-                        if let Some(m) = s.current_match() {
-                            offset = match_offset(m, max_offset);
-                        }
+                        jump_to_match(s, &mut offset, max_offset);
                     }
                 }
                 // Display toggles: flip the option and re-render the lines.
@@ -487,9 +490,7 @@ fn run_loop(
                 KeyCode::Char('n') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.next();
-                        if let Some(m) = s.current_match() {
-                            offset = match_offset(m, max_offset);
-                        }
+                        jump_to_match(s, &mut offset, max_offset);
                     } else {
                         opts.line_numbers = !opts.line_numbers;
                         needs_render = true;
@@ -780,6 +781,14 @@ fn file_to_offset(file_starts: &[usize], idx: usize, max_offset: u16) -> u16 {
 /// Scroll offset that brings match `m` into view (at the viewport top), clamped.
 fn match_offset(m: Match, max_offset: u16) -> u16 {
     (m.line.min(u16::MAX as usize) as u16).min(max_offset)
+}
+
+/// After the search cursor moves, scroll so the current match sits at the
+/// viewport top (clamped). No-op when the search matched nothing.
+fn jump_to_match(search: &Search, offset: &mut u16, max_offset: u16) {
+    if let Some(m) = search.current_match() {
+        *offset = match_offset(m, max_offset);
+    }
 }
 
 /// Flatten a rendered line to its plain text (span contents concatenated), so
