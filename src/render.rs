@@ -72,6 +72,10 @@ const BLANK_GUTTER: &str = "     ";
 pub struct RenderedDiff {
     pub lines: Vec<Line<'static>>,
     pub file_starts: Vec<usize>,
+    /// Rendered ROW index where each hunk begins (its header row, or first body
+    /// row when headers are off), ascending. Drives `{`/`}` prev/next-hunk jumps.
+    /// A collapsed generated file contributes none (its hunks aren't emitted).
+    pub hunk_starts: Vec<usize>,
     pub fold_bars: Vec<(usize, FoldId)>,
 }
 
@@ -167,6 +171,7 @@ fn layout_rows(
         return RenderedDiff {
             lines: vec![Line::from("No changes in the working tree.")],
             file_starts: Vec::new(),
+            hunk_starts: Vec::new(),
             fold_bars: Vec::new(),
         };
     }
@@ -264,6 +269,8 @@ fn stack_rows(
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
+    // Row where each hunk begins, ascending; drives `{`/`}` hunk navigation.
+    let mut hunk_starts: Vec<usize> = Vec::new();
     // Row -> FoldId for every emitted fold bar, ascending by row (we append top
     // to bottom). The app uses this to find the fold nearest the viewport.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
@@ -288,6 +295,9 @@ fn stack_rows(
             if file_collapsed {
                 break;
             }
+            // Record where this hunk starts (its header row, or first body row
+            // when headers are off) for `{`/`}` navigation.
+            hunk_starts.push(out.len());
             push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the hunk header.
@@ -427,6 +437,7 @@ fn stack_rows(
     RenderedDiff {
         lines: out,
         file_starts,
+        hunk_starts,
         fold_bars,
     }
 }
@@ -507,6 +518,7 @@ fn split_rows(
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
+    let mut hunk_starts: Vec<usize> = Vec::new();
     // Split emits only whole-file (generated) fold bars, not per-hunk context folds.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
     for (file_idx, file) in model.files.iter().enumerate() {
@@ -523,6 +535,7 @@ fn split_rows(
             if file_collapsed {
                 break;
             }
+            hunk_starts.push(out.len());
             push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the header. Old
@@ -610,6 +623,7 @@ fn split_rows(
     RenderedDiff {
         lines: out,
         file_starts,
+        hunk_starts,
         fold_bars,
     }
 }
