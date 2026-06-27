@@ -469,9 +469,10 @@ fn run_loop(
 
     // Live auto-refresh: poll the reload source on an interval and rebuild only
     // when the diff text actually changed. On by default for sources whose
-    // policy says so (working-tree, staged) and that have a re-fetchable source.
-    // The runtime toggle and configurable interval arrive in later slices.
-    let live_on = source.live_policy().default_on && reload.is_some();
+    // policy says so (working-tree, staged); the `L` key toggles it for any
+    // toggleable source. The configurable interval arrives in a later slice.
+    let live_policy = source.live_policy();
+    let mut live_on = live_policy.default_on && reload.is_some();
     let mut last_fetch = Instant::now();
 
     loop {
@@ -553,6 +554,8 @@ fn run_loop(
             blame_cache: &blame_cache,
             blame_keys: &blame_keys,
             blame_now,
+            live_on,
+            live_toggleable: live_policy.toggleable,
         };
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
@@ -898,6 +901,16 @@ fn run_loop(
                         blame_cache = fetch_all_blame(&summaries);
                     }
                 }
+                // Toggle live auto-refresh. A no-op on sources that can never go
+                // live (a commit/stash/PR/patch file, or piped stdin) — their
+                // indicator is greyed out. Re-arm the timer on enable so the
+                // first poll lands within one interval, not after a stale one.
+                KeyCode::Char('L') if live_policy.toggleable && reload.is_some() => {
+                    live_on = !live_on;
+                    if live_on {
+                        last_fetch = Instant::now();
+                    }
+                }
                 _ => {}
             }
         }
@@ -1017,6 +1030,10 @@ struct ReviewFrame<'a> {
     blame_keys: &'a HashMap<usize, (usize, usize)>,
     /// Epoch seconds used to render relative blame ages.
     blame_now: i64,
+    /// Whether live auto-refresh is currently polling.
+    live_on: bool,
+    /// Whether `L` can toggle live here (drives the greyed-out indicator).
+    live_toggleable: bool,
 }
 
 /// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
@@ -1113,6 +1130,8 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
                 v.opts,
                 v.wrap,
                 v.theme,
+                v.live_on,
+                v.live_toggleable,
             ),
             chunks[1],
         );
@@ -1457,6 +1476,7 @@ fn sidebar(summaries: &[FileSummary], selected: usize, theme: &Theme) -> Paragra
 
 /// The 1-line status bar: file position, scroll position, active toggles, and
 /// pointers to the sidebar and help dialog.
+#[allow(clippy::too_many_arguments)]
 fn status_bar(
     file_count: usize,
     selected_file: usize,
@@ -1465,6 +1485,8 @@ fn status_bar(
     opts: &RenderOptions,
     wrap: bool,
     theme: &Theme,
+    live_on: bool,
+    live_toggleable: bool,
 ) -> Paragraph<'static> {
     let pct = if max_offset == 0 {
         100
@@ -1508,12 +1530,29 @@ fn status_bar(
     let text = format!(
         " file {pos}/{file_count}  {pct}%  [{toggles}]  o fold  s sidebar  e edit  ? help "
     );
-    Paragraph::new(text).style(
-        Style::default()
-            .fg(theme.status_fg)
-            .bg(theme.status_bg)
-            .add_modifier(Modifier::BOLD),
-    )
+    let base = Style::default()
+        .fg(theme.status_fg)
+        .bg(theme.status_bg)
+        .add_modifier(Modifier::BOLD);
+    // LIVE indicator: a reversed chip when auto-refresh is polling so it stands
+    // out regardless of theme; greyed out otherwise — both when it is off and
+    // when the source can never go live (`L` is a no-op there).
+    let live_style = if live_on {
+        base.add_modifier(Modifier::REVERSED)
+    } else if live_toggleable {
+        // Off, but `L` can enable it: normal (non-bold) status color.
+        base.remove_modifier(Modifier::BOLD)
+    } else {
+        // Source can never go live (`L` is a no-op): greyed out.
+        base.remove_modifier(Modifier::BOLD).fg(Color::DarkGray)
+    };
+    // The Paragraph-level style fills the rest of the row with the status bg;
+    // the spans paint their own styles on top.
+    Paragraph::new(Line::from(vec![
+        Span::styled(text, base),
+        Span::styled(" LIVE ", live_style),
+    ]))
+    .style(base)
 }
 
 /// Render the centered, bordered help overlay listing every keybinding. The
@@ -1550,6 +1589,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "",
         "  e   open file in $EDITOR",
         "  r   reload the diff from its source",
+        "  L   toggle live auto-refresh",
         "  B   blame gutter (working-tree diff)",
         "  drag   select lines; release copies (OSC52)",
         "  Ctrl-Z suspend  Ctrl-C quit",
@@ -1734,6 +1774,8 @@ index 5555555..6666666 100644
             blame_cache: &blame_empty,
             blame_keys: &blame_keys_empty,
             blame_now: 0,
+            live_on: false,
+            live_toggleable: false,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -1797,6 +1839,8 @@ index 5555555..6666666 100644
             blame_cache: &blame_cache,
             blame_keys: &rendered.blame_keys,
             blame_now: 0,
+            live_on: false,
+            live_toggleable: false,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -2075,6 +2119,8 @@ index 5555555..6666666 100644
             blame_cache: &blame_empty,
             blame_keys: &blame_keys_empty,
             blame_now: 0,
+            live_on: false,
+            live_toggleable: false,
         };
 
         let backend = TestBackend::new(130, 20);
