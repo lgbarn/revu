@@ -41,9 +41,17 @@ use crate::worddiff::compute_word_emphasis;
 pub fn run_diff(
     staged: bool,
     exclude_untracked: bool,
+    pr: Option<u64>,
     targets: Vec<String>,
     overrides: ConfigOverrides,
 ) -> Result<()> {
+    // `--pr <n>` reviews a GitHub PR by delegating the fetch to the user's `gh`
+    // (revu itself makes no network call). It supersedes the working-tree paths.
+    if let Some(number) = pr {
+        let diff_text = gh_pr_diff(number)?;
+        return review_text(&diff_text, &overrides);
+    }
+
     let adapter = GitAdapter::new();
 
     let diff_text = if targets.len() == 2
@@ -62,6 +70,35 @@ pub fn run_diff(
         })?
     };
     review_text(&diff_text, &overrides)
+}
+
+/// The argv (after the `gh` program name) that fetches PR `number`'s diff.
+/// Split out as a pure function so it is unit-testable without invoking `gh`,
+/// mirroring the git-argv tests in `vcs::git`.
+fn gh_pr_diff_args(number: u64) -> Vec<String> {
+    vec!["pr".to_string(), "diff".to_string(), number.to_string()]
+}
+
+/// Fetch a GitHub pull request's diff by shelling out to `gh pr diff <n>`. revu
+/// makes no network call itself — `gh` does, using the user's existing auth.
+/// Surfaces a clear, actionable error when `gh` is missing or the command fails
+/// (not installed, not a GitHub repo, unknown PR, not authenticated).
+fn gh_pr_diff(number: u64) -> Result<String> {
+    use anyhow::{bail, Context};
+
+    let output = std::process::Command::new("gh")
+        .args(gh_pr_diff_args(number))
+        .output()
+        .context("could not run `gh` — install the GitHub CLI and ensure it is on PATH")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("`gh pr diff {number}` failed (exit {})", output.status);
+        }
+        bail!("`gh pr diff {number}` failed: {detail}");
+    }
+    String::from_utf8(output.stdout).context("`gh pr diff` produced non-UTF-8 output")
 }
 
 /// Review a commit. `reff` defaults to `HEAD`. Reuses the shared [`review_text`]
@@ -1466,6 +1503,14 @@ index 5555555..6666666 100644
         );
         // With no hunks, `{`/`}` are not handled (return None).
         assert_eq!(scroll_offset(KeyCode::Char('}'), 0, 10, 100, fs, &[]), None);
+    }
+
+    #[test]
+    fn gh_pr_diff_args_builds_pr_diff_command() {
+        assert_eq!(
+            gh_pr_diff_args(123),
+            vec!["pr".to_string(), "diff".to_string(), "123".to_string()]
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ revu diff                     # working-tree changes
 revu diff --staged            # only staged changes
 revu diff -- src/             # scope to a path
 revu diff old.txt new.txt     # compare two arbitrary files
+revu diff --pr 123            # review GitHub PR #123 (via your gh CLI)
 revu show                     # review HEAD
 revu show <commit>            # review a specific commit
 revu stash show               # review the latest stash
@@ -117,6 +118,7 @@ Global (work anywhere):
 | --- | --- |
 | `--staged` (alias `--cached`) | Review only staged changes |
 | `--exclude-untracked` | Omit untracked files from the working-tree review |
+| `--pr <N>` | Review GitHub PR `<N>` via `gh pr diff` (no in-process network; needs the `gh` CLI) |
 
 Display flags — override the config file, and are accepted by `diff`, `show`,
 `stash show`, `difftool`, `pager`, and `patch`:
