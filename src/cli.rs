@@ -1,4 +1,6 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+use crate::config::ConfigOverrides;
 
 #[derive(Parser)]
 #[command(
@@ -9,6 +11,71 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Display flags shared by every subcommand that renders a diff interactively.
+/// Flattened into each variant so `revu show --theme dracula`, `revu pager
+/// --mode split`, etc. all work the same way `revu diff` does. Each is an
+/// optional override: unset means "defer to config + saved view-state".
+///
+/// Each `--flag` / `--no-flag` pair resolves to an `Option<bool>` (unset =>
+/// defer to config); `overrides_with` makes the last-specified flag win if both
+/// are passed.
+#[derive(Args, Default)]
+pub struct DisplayFlags {
+    /// Show the line-number gutter (overrides config)
+    #[arg(long = "line-numbers", overrides_with = "no_line_numbers")]
+    line_numbers: bool,
+    /// Hide the line-number gutter (overrides config)
+    #[arg(long = "no-line-numbers", overrides_with = "line_numbers")]
+    no_line_numbers: bool,
+
+    /// Wrap long lines (overrides config)
+    #[arg(long = "wrap", overrides_with = "no_wrap")]
+    wrap: bool,
+    /// Truncate long lines (overrides config)
+    #[arg(long = "no-wrap", overrides_with = "wrap")]
+    no_wrap: bool,
+
+    /// Show `@@` hunk headers (overrides config)
+    #[arg(long = "hunk-headers", overrides_with = "no_hunk_headers")]
+    hunk_headers: bool,
+    /// Hide `@@` hunk headers (overrides config)
+    #[arg(long = "no-hunk-headers", overrides_with = "hunk_headers")]
+    no_hunk_headers: bool,
+
+    /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
+    #[arg(long)]
+    theme: Option<String>,
+    /// Layout mode: `auto` (width-responsive), `split`, or `stack`/`unified`
+    #[arg(long)]
+    mode: Option<String>,
+}
+
+impl DisplayFlags {
+    /// Collapse the parsed flags into the config-override struct the app uses.
+    pub fn into_overrides(self) -> ConfigOverrides {
+        ConfigOverrides {
+            theme: self.theme,
+            mode: self.mode,
+            line_numbers: flag_pair(self.line_numbers, self.no_line_numbers),
+            wrap_lines: flag_pair(self.wrap, self.no_wrap),
+            hunk_headers: flag_pair(self.hunk_headers, self.no_hunk_headers),
+        }
+    }
+}
+
+/// Collapse a `--flag` / `--no-flag` boolean pair into an `Option<bool>`:
+/// `Some(true)`/`Some(false)` when set, `None` when neither was passed (defer to
+/// config). clap's `overrides_with` guarantees at most one is true.
+fn flag_pair(yes: bool, no: bool) -> Option<bool> {
+    if yes {
+        Some(true)
+    } else if no {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[derive(Subcommand)]
@@ -23,36 +90,8 @@ pub enum Command {
         #[arg(long)]
         exclude_untracked: bool,
 
-        // Display overrides. Each is a `--flag` / `--no-flag` pair resolving to
-        // an `Option<bool>` (unset => defer to config). `overrides_with` makes
-        // the last-specified flag win if both are passed.
-        /// Show the line-number gutter (overrides config)
-        #[arg(long = "line-numbers", overrides_with = "no_line_numbers")]
-        line_numbers: bool,
-        /// Hide the line-number gutter (overrides config)
-        #[arg(long = "no-line-numbers", overrides_with = "line_numbers")]
-        no_line_numbers: bool,
-
-        /// Wrap long lines (overrides config)
-        #[arg(long = "wrap", overrides_with = "no_wrap")]
-        wrap: bool,
-        /// Truncate long lines (overrides config)
-        #[arg(long = "no-wrap", overrides_with = "wrap")]
-        no_wrap: bool,
-
-        /// Show `@@` hunk headers (overrides config)
-        #[arg(long = "hunk-headers", overrides_with = "no_hunk_headers")]
-        hunk_headers: bool,
-        /// Hide `@@` hunk headers (overrides config)
-        #[arg(long = "no-hunk-headers", overrides_with = "hunk_headers")]
-        no_hunk_headers: bool,
-
-        /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
-        #[arg(long)]
-        theme: Option<String>,
-        /// Layout mode (parsed/carried; applied in a later milestone)
-        #[arg(long)]
-        mode: Option<String>,
+        #[command(flatten)]
+        display: DisplayFlags,
 
         /// Limit the review to matching paths, or diff two files when given
         /// exactly two existing paths. Arguments after `--` land here too.
@@ -63,6 +102,8 @@ pub enum Command {
     Show {
         /// Commit to review (default HEAD)
         reff: Option<String>,
+        #[command(flatten)]
+        display: DisplayFlags,
     },
 
     /// Review stash entries
@@ -83,15 +124,22 @@ pub enum Command {
         right: String,
         /// In-repo path git difftool passes (informational in v1)
         path: Option<String>,
+        #[command(flatten)]
+        display: DisplayFlags,
     },
 
     /// Render a diff piped on stdin; usable as git's core.pager
-    Pager,
+    Pager {
+        #[command(flatten)]
+        display: DisplayFlags,
+    },
 
     /// Review a patch file, or a piped diff with `-` (or no argument)
     Patch {
         /// Patch file to review; `-` or omitted reads from stdin
         file: Option<String>,
+        #[command(flatten)]
+        display: DisplayFlags,
     },
 }
 
@@ -101,6 +149,8 @@ pub enum StashCmd {
     Show {
         /// Stash entry to review (default stash@{0})
         reff: Option<String>,
+        #[command(flatten)]
+        display: DisplayFlags,
     },
 }
 
@@ -112,7 +162,9 @@ mod tests {
     fn parses_difftool_with_path() {
         let cli = Cli::parse_from(["revu", "difftool", "LOCAL", "REMOTE", "src/x.rs"]);
         match cli.command {
-            Command::Difftool { left, right, path } => {
+            Command::Difftool {
+                left, right, path, ..
+            } => {
                 assert_eq!(left, "LOCAL");
                 assert_eq!(right, "REMOTE");
                 assert_eq!(path.as_deref(), Some("src/x.rs"));
@@ -125,11 +177,53 @@ mod tests {
     fn parses_difftool_path_optional() {
         let cli = Cli::parse_from(["revu", "difftool", "LOCAL", "REMOTE"]);
         match cli.command {
-            Command::Difftool { left, right, path } => {
+            Command::Difftool {
+                left, right, path, ..
+            } => {
                 assert_eq!((left.as_str(), right.as_str()), ("LOCAL", "REMOTE"));
                 assert!(path.is_none());
             }
             _ => panic!("expected Difftool"),
+        }
+    }
+
+    #[test]
+    fn show_accepts_display_flags() {
+        let cli = Cli::parse_from([
+            "revu",
+            "show",
+            "HEAD",
+            "--theme",
+            "dracula",
+            "--mode",
+            "split",
+            "--no-line-numbers",
+        ]);
+        match cli.command {
+            Command::Show { reff, display } => {
+                assert_eq!(reff.as_deref(), Some("HEAD"));
+                let ov = display.into_overrides();
+                assert_eq!(ov.theme.as_deref(), Some("dracula"));
+                assert_eq!(ov.mode.as_deref(), Some("split"));
+                assert_eq!(ov.line_numbers, Some(false));
+            }
+            _ => panic!("expected Show"),
+        }
+    }
+
+    #[test]
+    fn pager_parses_with_and_without_flags() {
+        // Bare `revu pager` (how git invokes it) must still parse.
+        assert!(matches!(
+            Cli::parse_from(["revu", "pager"]).command,
+            Command::Pager { .. }
+        ));
+        let cli = Cli::parse_from(["revu", "pager", "--theme", "nord"]);
+        match cli.command {
+            Command::Pager { display } => {
+                assert_eq!(display.into_overrides().theme.as_deref(), Some("nord"));
+            }
+            _ => panic!("expected Pager"),
         }
     }
 }
