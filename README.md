@@ -108,8 +108,10 @@ git config --global core.pager "revu pager"
 | `g` / `G` | top / bottom | `m` | cycle layout (auto/split/stack) |
 | `n` | line numbers | `t` | theme picker |
 | `w` | line wrap | `e` | open file in `$EDITOR` |
-| `H` | hunk headers | `?` | help |
-| `c` | collapse context | `q` / `Esc` | quit |
+| `H` | hunk headers | `o` / `Enter` | toggle fold at cursor |
+| `c` | collapse all context | `O` / `C` | expand / collapse all folds |
+| `?` | help | `Ctrl-Z` | suspend (resume with `fg`) |
+| `q` / `Esc` / `Ctrl-C` | quit | | |
 
 ## Configuration
 
@@ -137,10 +139,16 @@ Themes: `github-light`, `github-dark`, `catppuccin-mocha`, `dracula`, `nord`,
 `tokyo-night`, `gruvbox-dark`, `gruvbox-light`, `solarized-dark`,
 `solarized-light`, `monokai`, `one-dark`.
 
+Two further keys are accepted for hunk-config compatibility but are **not yet
+applied**: `transparent_background` (bool) is reserved for using the terminal's
+background instead of the theme's, and `vcs` (string) names a preferred VCS
+backend (only `git` is supported today). Setting them has no effect yet.
+
 ## Status
 
-v0.1.0 — the full review feature set is implemented and tested. revu is young;
-issues and PRs welcome.
+The full review feature set is implemented and tested. revu is young; issues
+and PRs welcome. See [CHANGELOG.md](CHANGELOG.md) for the release history and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Releasing
 

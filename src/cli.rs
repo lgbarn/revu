@@ -1,3 +1,8 @@
+//! Command-line interface: the clap command and argument definitions for the
+//! `diff`, `show`, `stash`, `difftool`, `pager`, and `patch` subcommands, plus
+//! the shared `DisplayFlags` that carry display overrides into config
+//! resolution.
+
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::ConfigOverrides;

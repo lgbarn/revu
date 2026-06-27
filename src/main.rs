@@ -1,3 +1,10 @@
+//! revu — a fast, memory-safe terminal diff and code-review tool (a Rust port
+//! of hunk).
+//!
+//! `main` parses the CLI (`cli`) and dispatches each subcommand to an
+//! `app::run_*` entry point, which loads the diff, parses it (`diff`), and
+//! renders it interactively (`render`).
+
 mod app;
 mod cli;
 mod config;
