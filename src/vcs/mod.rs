@@ -42,4 +42,12 @@ pub trait VcsAdapter {
 
     /// The colored diff for a stash entry (e.g. `stash@{0}`).
     fn stash_show(&self, reff: &str) -> Result<String>;
+
+    /// `git blame --porcelain` for `path`, optionally at revision `reff` (the
+    /// new side of the diff). `None` blames the working-tree file. The caller
+    /// parses the porcelain with [`crate::blame::parse_blame`].
+    // ponytail: consumed by the `B` blame-gutter render in the follow-up
+    // integration (#53); dead until then, allowed deliberately.
+    #[allow(dead_code)]
+    fn blame(&self, reff: Option<&str>, path: &str) -> Result<String>;
 }

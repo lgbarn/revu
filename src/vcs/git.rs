@@ -161,6 +161,26 @@ impl VcsAdapter for GitAdapter {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    fn blame(&self, reff: Option<&str>, path: &str) -> Result<String> {
+        // `--porcelain` is the stable, parse-friendly format; the caller feeds
+        // it to `blame::parse_blame`. `<reff>` (when given) blames the file at
+        // that revision so the line numbers match the diff's new side; without
+        // it, the working-tree file is blamed. `--` separates the pathspec so a
+        // path beginning with `-` is never read as a flag.
+        let mut args: Vec<&str> = vec!["blame", "--porcelain"];
+        if let Some(r) = reff {
+            args.push(r);
+        }
+        args.push("--");
+        args.push(path);
+        let out = self.run(&args)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("git blame failed: {}", stderr.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 impl GitAdapter {
@@ -485,5 +505,25 @@ mod tests {
             out.contains("STASHED_LINE"),
             "missing stashed change: {out}"
         );
+    }
+
+    #[test]
+    fn blame_porcelain_attributes_committed_and_uncommitted_lines() {
+        let dir = fixture_repo();
+        let adapter = GitAdapter::in_dir(dir.path());
+        // committed.txt: line 1 committed by "Test", line 2 is an unstaged edit.
+        let porcelain = adapter.blame(None, "committed.txt").unwrap();
+        assert!(
+            porcelain.contains("author Test"),
+            "committed line attributed to its author: {porcelain}"
+        );
+        assert!(
+            porcelain.contains("Not Committed Yet"),
+            "the unstaged line shows as not committed yet: {porcelain}"
+        );
+        // And it parses into one BlameLine per source line (2 here).
+        let parsed = crate::blame::parse_blame(&porcelain);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].author, "Test");
     }
 }
