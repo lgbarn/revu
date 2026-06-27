@@ -26,6 +26,68 @@ pub struct FoldId {
     pub index: usize,
 }
 
+/// Reserved `FoldId::index` for a whole-file fold (a generated file collapsed to
+/// a single bar). Out of the range of per-hunk context folds, which number up
+/// from 0, so the two never collide within a file.
+pub const FILE_FOLD_INDEX: usize = usize::MAX;
+
+/// The whole-file fold id for the `file`-th file. Lets generated-file collapse
+/// reuse the existing fold toggle / expand-all controls with no new machinery.
+pub fn file_fold_id(file: usize) -> FoldId {
+    FoldId {
+        file,
+        index: FILE_FOLD_INDEX,
+    }
+}
+
+/// Whether `path` names a generated/vendored file whose diff is noise to a
+/// reviewer — lockfiles, minified bundles, source maps, and common codegen
+/// outputs. Matched on the file name (and a few suffixes), so it is independent
+/// of the directory. The renderer collapses these to a single bar by default.
+///
+/// ponytail: a fixed name/suffix list, not a content heuristic. Covers the
+/// common ecosystems; extend the lists if a real diff slips through.
+pub fn is_generated(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    const LOCKFILES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "deno.lock",
+        "Gemfile.lock",
+        "poetry.lock",
+        "Pipfile.lock",
+        "composer.lock",
+        "go.sum",
+        "flake.lock",
+        "mix.lock",
+        "pubspec.lock",
+        "Podfile.lock",
+        "packages.lock.json",
+        "gradle.lockfile",
+    ];
+    if LOCKFILES.contains(&name) {
+        return true;
+    }
+    // Minified bundles, source maps, and common generated sources.
+    const SUFFIXES: &[&str] = &[
+        ".min.js",
+        ".min.mjs",
+        ".min.css",
+        ".js.map",
+        ".css.map",
+        ".pb.go",
+        "_pb2.py",
+        "_pb2_grpc.py",
+        ".g.dart",
+        ".freezed.dart",
+    ];
+    SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
 /// One fold: the half-open range `[start, end)` of HIDDEN line indices within a
 /// hunk's `lines` (every line in the range is [`LineKind::Context`]). The kept
 /// margin lines lie just outside the range.
@@ -217,6 +279,48 @@ mod tests {
         assert_eq!(f[1].id, FoldId { file: 2, index: 6 });
         assert_eq!(f[2].id, FoldId { file: 2, index: 7 });
         assert_eq!(idx, 8, "next_index advanced past the three folds");
+    }
+
+    #[test]
+    fn is_generated_flags_lockfiles_minified_and_codegen() {
+        // Lockfiles, regardless of directory.
+        assert!(is_generated("Cargo.lock"));
+        assert!(is_generated("frontend/package-lock.json"));
+        assert!(is_generated("a/b/c/yarn.lock"));
+        assert!(is_generated("go.sum"));
+        // Minified bundles and source maps.
+        assert!(is_generated("dist/app.min.js"));
+        assert!(is_generated("public/styles.min.css"));
+        assert!(is_generated("build/bundle.js.map"));
+        // Common generated sources.
+        assert!(is_generated("api/schema.pb.go"));
+        assert!(is_generated("gen/service_pb2.py"));
+    }
+
+    #[test]
+    fn is_generated_leaves_ordinary_source_alone() {
+        assert!(!is_generated("src/main.rs"));
+        assert!(!is_generated("README.md"));
+        assert!(!is_generated("src/lock.rs"));
+        // Case-sensitive: only the real capitalized lockfile name matches.
+        assert!(!is_generated("src/cargo.lock"));
+        // A plain map module is not a source map.
+        assert!(!is_generated("src/world_map.rs"));
+    }
+
+    #[test]
+    fn file_fold_id_uses_reserved_index_distinct_from_context_folds() {
+        let id = file_fold_id(3);
+        assert_eq!(
+            id,
+            FoldId {
+                file: 3,
+                index: FILE_FOLD_INDEX
+            }
+        );
+        // Context folds number up from 0, so they never reach the reserved index.
+        let f = folds(&format!("+{}+", "c".repeat(10)));
+        assert_ne!(f[0].id.index, FILE_FOLD_INDEX);
     }
 
     #[test]
