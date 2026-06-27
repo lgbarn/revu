@@ -99,6 +99,39 @@ git config --global core.pager "revu pager"
 
 `revu difftool <local> <remote>` is also wired for `git difftool`.
 
+### Options
+
+Run `revu --help` or `revu <command> --help` for the authoritative list; this is
+the full surface.
+
+Global (work anywhere):
+
+| Flag | Description |
+| --- | --- |
+| `-h`, `--help` | Print help for revu or a subcommand |
+| `-V`, `--version` | Print the version and exit |
+
+`diff` additionally accepts:
+
+| Flag | Description |
+| --- | --- |
+| `--staged` (alias `--cached`) | Review only staged changes |
+| `--exclude-untracked` | Omit untracked files from the working-tree review |
+
+Display flags — override the config file, and are accepted by `diff`, `show`,
+`stash show`, `difftool`, `pager`, and `patch`:
+
+| Flag | Description |
+| --- | --- |
+| `--theme <THEME>` | Color theme (e.g. `auto`, `dracula`, `github-dark`) |
+| `--mode <MODE>` | Layout: `auto` (width-responsive), `split`, or `stack`/`unified` |
+| `--line-numbers` / `--no-line-numbers` | Show / hide the line-number gutter |
+| `--wrap` / `--no-wrap` | Wrap / truncate long lines |
+| `--hunk-headers` / `--no-hunk-headers` | Show / hide `@@` hunk headers |
+
+Each display flag mirrors a key in `config.toml` (see [Configuration](#configuration));
+the CLI flag wins when both are set.
+
 ## Keybindings
 
 | Key | Action | Key | Action |
