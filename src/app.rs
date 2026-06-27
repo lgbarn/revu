@@ -203,6 +203,20 @@ fn build_model(diff_text: &str) -> DiffModel {
     model
 }
 
+/// The compare-before-rebuild decision for a live re-fetch: rebuild the model
+/// only when the freshly fetched text differs from what is on screen, else do
+/// nothing. Returning `None` on no change is what keeps an idle poll cheap AND
+/// gates the live blame refetch — blame is refreshed only inside the `Some`
+/// (changed) branch, so an unchanged diff never re-runs `git blame`. Pulled out
+/// of `run_loop` so this rule is unit-testable in isolation.
+fn apply_live_fetch(current_text: &str, fetched: &str) -> Option<DiffModel> {
+    if fetched == current_text {
+        None
+    } else {
+        Some(build_model(fetched))
+    }
+}
+
 /// Parse unified diff text and review it interactively. Shared by `diff`,
 /// `pager`, and `patch` so there is a single render-loop path. `overrides`
 /// are the CLI display flags (empty for `pager`/`patch`). `reload`, when set,
@@ -576,9 +590,13 @@ fn run_loop(
         if live_on && last_fetch.elapsed() >= live_interval {
             last_fetch = Instant::now();
             if let Some(Ok(text)) = reload.as_ref().map(|fetch| fetch()) {
-                if text != current_text {
+                // `apply_live_fetch` returns the rebuilt model only when the text
+                // changed; an unchanged diff yields `None`, so the whole block —
+                // including the blame refetch — is skipped (no rebuild, no
+                // `git blame`, no flicker).
+                if let Some(new_model) = apply_live_fetch(&current_text, &text) {
                     current_text = text;
-                    model = build_model(&current_text);
+                    model = new_model;
                     summaries = file_summaries(&model);
                     file_count = model.files.len();
                     // Content changed, so a live blame gutter is now stale.
@@ -2032,6 +2050,21 @@ index 5555555..6666666 100644
         assert_eq!(clamp_offset(40, 30, 20), 10);
         // Diff shorter than the viewport -> no scrolling, offset pinned to 0.
         assert_eq!(clamp_offset(5, 8, 20), 0);
+    }
+
+    #[test]
+    fn apply_live_fetch_rebuilds_only_on_change() {
+        let diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        // Unchanged text -> None: nothing to apply, so the live block is skipped
+        // and (the point of #76) `git blame` is NOT refetched on an idle poll.
+        assert!(apply_live_fetch(diff, diff).is_none());
+        // A real change -> Some(model): the caller rebuilds and, if blame is on,
+        // refetches blame inside this same branch.
+        let changed = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+c\n";
+        assert!(apply_live_fetch(diff, changed).is_some());
+        // Going from empty to non-empty (and back) both count as changes.
+        assert!(apply_live_fetch("", diff).is_some());
+        assert!(apply_live_fetch("", "").is_none());
     }
 
     #[test]
