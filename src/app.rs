@@ -1682,7 +1682,10 @@ index 5555555..6666666 100644
         let catalog = crate::theme::catalog();
         let opts = RenderOptions::default(); // stack -> produces blame_keys
         let rendered = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 80);
-        assert!(!rendered.blame_keys.is_empty(), "stack render yields blame keys");
+        assert!(
+            !rendered.blame_keys.is_empty(),
+            "stack render yields blame keys"
+        );
 
         // Attribute every new-side line of every file to "Grace".
         let blines: Vec<crate::blame::BlameLine> = (0..200)
