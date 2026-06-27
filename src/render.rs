@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::diff::{DiffLine, DiffModel, FileDiff, Hunk, LineKind};
-use crate::fold::{compute_hunk_folds, is_expanded, FoldId};
+use crate::fold::{compute_hunk_folds, file_fold_id, is_expanded, is_generated, FoldId};
 use crate::highlight::Highlighter;
 use crate::theme::Theme;
 
@@ -172,10 +172,10 @@ fn layout_rows(
     }
     match opts.mode {
         LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, folds, width),
-        // ponytail: the split layout renders every line uncollapsed (no folds).
-        // Folds target the stack view, which is the default; split is opt-in /
-        // wide-terminal only. Folding split's paired change-groups is a later add.
-        LayoutMode::Split => split_rows(model, highlighter, theme, opts, width),
+        // ponytail: split renders every CONTEXT line uncollapsed (no per-hunk
+        // folds); folding its paired change-groups is a later add. It does honor
+        // whole-file generated-file collapse, so noise files fold in both layouts.
+        LayoutMode::Split => split_rows(model, highlighter, theme, opts, folds, width),
     }
 }
 
@@ -274,11 +274,20 @@ fn stack_rows(
         let mut fold_index = 0usize;
         push_file_header(&mut out, file, theme);
 
+        // A generated file (lockfile, minified bundle, codegen) collapses to a
+        // single whole-file fold bar so its noise doesn't bury real changes. The
+        // reserved fold id means the existing o/O/C controls expand it.
+        let file_collapsed =
+            file_collapse_bar(&mut out, &mut fold_bars, file, file_idx, folds, theme);
+
         // Resolve the file's syntax once; unknown extensions fall back to plain
         // text inside `syntax_for_path`.
         let syntax = highlighter.syntax_for_path(&file.path);
 
         for hunk in &file.hunks {
+            if file_collapsed {
+                break;
+            }
             push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the hunk header.
@@ -436,6 +445,43 @@ fn fold_bar_line(hidden: usize, expanded: bool, theme: &Theme) -> Line<'static> 
     ))
 }
 
+/// Emit the generated-file collapse bar for `file` when it is generated,
+/// recording its fold id in `fold_bars`. Returns true when the body should be
+/// hidden (generated AND not expanded); false (a no-op) for ordinary files.
+/// Shared by both layouts so generated files collapse the same way in each.
+fn file_collapse_bar(
+    out: &mut Vec<Line<'static>>,
+    fold_bars: &mut Vec<(usize, FoldId)>,
+    file: &FileDiff,
+    file_idx: usize,
+    folds: &HashSet<FoldId>,
+    theme: &Theme,
+) -> bool {
+    if !is_generated(&file.path) {
+        return false;
+    }
+    let id = file_fold_id(file_idx);
+    let hidden: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    fold_bars.push((out.len(), id));
+    let expanded = is_expanded(folds, id);
+    out.push(file_fold_bar_line(hidden, expanded, theme));
+    !expanded
+}
+
+/// The whole-file fold bar for a generated file: collapsed (`▼`) hides the whole
+/// diff body behind a one-line summary; expanded (`▲`) gives re-collapse a row to
+/// target. Drawn like a normal fold bar so it reads as the same chrome.
+fn file_fold_bar_line(hidden: usize, expanded: bool, theme: &Theme) -> Line<'static> {
+    let arrow = if expanded { '▲' } else { '▼' };
+    let text = format!("  {arrow} {hidden} lines hidden (generated)");
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(theme.gutter)
+            .add_modifier(Modifier::DIM),
+    ))
+}
+
 /// Column separator between the old (left) and new (right) panes in split view.
 const SEP: u16 = 1;
 
@@ -454,20 +500,29 @@ fn split_rows(
     highlighter: &Highlighter,
     theme: &Theme,
     opts: &RenderOptions,
+    folds: &HashSet<FoldId>,
     width: u16,
 ) -> RenderedDiff {
     let col_w = (width.saturating_sub(SEP) / 2).max(1) as usize;
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
-    for file in &model.files {
+    // Split emits only whole-file (generated) fold bars, not per-hunk context folds.
+    let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
+    for (file_idx, file) in model.files.iter().enumerate() {
         // Same file_starts contract as stack: the header row index per file.
         file_starts.push(out.len());
         push_file_header(&mut out, file, theme);
 
+        let file_collapsed =
+            file_collapse_bar(&mut out, &mut fold_bars, file, file_idx, folds, theme);
+
         let syntax = highlighter.syntax_for_path(&file.path);
 
         for hunk in &file.hunks {
+            if file_collapsed {
+                break;
+            }
             push_hunk_header(&mut out, hunk, opts, theme);
 
             // Old- and new-side line counters, seeded from the header. Old
@@ -555,8 +610,7 @@ fn split_rows(
     RenderedDiff {
         lines: out,
         file_starts,
-        // Split renders every line uncollapsed, so it emits no fold bars.
-        fold_bars: Vec::new(),
+        fold_bars,
     }
 }
 
@@ -1732,5 +1786,95 @@ index 1111111..2222222 100644
             .unwrap();
 
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    const GENERATED_SAMPLE: &str = "\
+diff --git a/Cargo.lock b/Cargo.lock
+index 1111111..2222222 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,3 +1,3 @@
+ [[package]]
+-version = \"1.0.0\"
++version = \"1.0.1\"
+ name = \"revu\"
+";
+
+    /// Flatten rendered lines to their plain text for content assertions.
+    fn flatten(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_file_collapses_by_default_and_expands_on_request() {
+        let model = parse_unified_diff(GENERATED_SAMPLE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let opts = RenderOptions::default();
+
+        // Collapsed by default (no expanded folds): the header and a "(generated)"
+        // bar show, but the diff body is hidden.
+        let collapsed = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 60);
+        let text = flatten(&collapsed.lines);
+        assert!(
+            text.iter().any(|l| l.contains("Cargo.lock")),
+            "file header still shown: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("(generated)")),
+            "collapse bar shown: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("version =")),
+            "body hidden while collapsed: {text:?}"
+        );
+        // The whole-file fold bar is registered so the o/O/C controls can find it.
+        assert!(collapsed
+            .fold_bars
+            .iter()
+            .any(|&(_, id)| id == file_fold_id(0)));
+
+        // Expanding the whole-file fold reveals the body.
+        let mut expanded = HashSet::new();
+        expanded.insert(file_fold_id(0));
+        let shown = render_diff(&model, &highlighter, &theme, &opts, &expanded, 60);
+        assert!(
+            flatten(&shown.lines)
+                .iter()
+                .any(|l| l.contains("version =")),
+            "body shown once the file fold is expanded"
+        );
+    }
+
+    #[test]
+    fn generated_file_collapses_in_split_layout_too() {
+        let model = parse_unified_diff(GENERATED_SAMPLE);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions {
+            mode: LayoutMode::Split,
+            ..RenderOptions::default()
+        };
+        let collapsed = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            80,
+        );
+        let text = flatten(&collapsed.lines);
+        assert!(text.iter().any(|l| l.contains("(generated)")), "{text:?}");
+        assert!(
+            !text.iter().any(|l| l.contains("version =")),
+            "split also hides a collapsed generated file: {text:?}"
+        );
     }
 }
