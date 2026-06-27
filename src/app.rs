@@ -276,6 +276,7 @@ fn effective_mode(mode: &str, width: u16) -> LayoutMode {
     match mode {
         "split" => LayoutMode::Split,
         "stack" | "unified" => LayoutMode::Stack,
+        "vertical" => LayoutMode::Vertical,
         _ => {
             if width >= AUTO_SPLIT_MIN {
                 LayoutMode::Split
@@ -632,12 +633,14 @@ fn run_loop(
                     expanded_folds.clear();
                     needs_render = true;
                 }
-                // Cycle the layout mode auto -> split -> stack -> auto. The next
-                // loop iteration re-resolves the effective mode and re-renders.
+                // Cycle the layout auto -> split -> stack -> vertical -> auto.
+                // The next loop iteration re-resolves the effective mode and
+                // re-renders.
                 KeyCode::Char('m') => {
                     mode = match mode.as_str() {
                         "auto" => "split".to_string(),
                         "split" => "stack".to_string(),
+                        "stack" | "unified" => "vertical".to_string(),
                         _ => "auto".to_string(),
                     };
                     needs_render = true;
@@ -1187,7 +1190,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  o / Enter   toggle fold",
         "  O   expand all folds",
         "  C   collapse all folds",
-        "  m   cycle layout auto/split/stack",
+        "  m   cycle layout auto/split/stack/vertical",
         "  t   theme selector",
         "",
         "  e   open file in $EDITOR",
@@ -1384,6 +1387,7 @@ index 5555555..6666666 100644
         assert_eq!(effective_mode("split", 1), LayoutMode::Split);
         assert_eq!(effective_mode("stack", 9999), LayoutMode::Stack);
         assert_eq!(effective_mode("unified", 9999), LayoutMode::Stack);
+        assert_eq!(effective_mode("vertical", 1), LayoutMode::Vertical);
         // Auto (and unknown values) switch at AUTO_SPLIT_MIN.
         assert_eq!(
             effective_mode("auto", AUTO_SPLIT_MIN - 1),

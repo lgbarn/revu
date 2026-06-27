@@ -52,7 +52,8 @@ pub struct DisplayFlags {
     /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
     #[arg(long)]
     theme: Option<String>,
-    /// Layout mode: `auto` (width-responsive), `split`, or `stack`/`unified`
+    /// Layout mode: `auto` (width-responsive), `split`, `stack`/`unified`, or
+    /// `vertical` (old block above new block)
     #[arg(long)]
     mode: Option<String>,
 }

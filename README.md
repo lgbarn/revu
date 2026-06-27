@@ -37,8 +37,9 @@ startup. revu gives you the same day-to-day reviewing experience with:
 - **Drop-in git pager**: set `revu pager` as git's `core.pager` and every
   `git diff` / `git show` opens in revu; non-diff output falls back to your
   plain-text pager.
-- **Side-by-side or unified**: `--mode split`, `stack`, or `auto` (responsive to
-  terminal width); cycle live with `m`.
+- **Side-by-side, unified, or top/bottom**: `--mode split`, `stack`, `vertical`
+  (old block above new), or `auto` (responsive to terminal width); cycle live
+  with `m`.
 - **Syntax highlighting** by language, plus **intra-line word-diff** emphasis and
   **moved-line** coloring (via git's `--color-moved`).
 - **File sidebar** with add/remove counts and keyboard navigation.
@@ -126,7 +127,7 @@ Display flags — override the config file, and are accepted by `diff`, `show`,
 | Flag | Description |
 | --- | --- |
 | `--theme <THEME>` | Color theme (e.g. `auto`, `dracula`, `github-dark`) |
-| `--mode <MODE>` | Layout: `auto` (width-responsive), `split`, or `stack`/`unified` |
+| `--mode <MODE>` | Layout: `auto` (width-responsive), `split`, `stack`/`unified`, or `vertical` (old above new) |
 | `--line-numbers` / `--no-line-numbers` | Show / hide the line-number gutter |
 | `--wrap` / `--no-wrap` | Wrap / truncate long lines |
 | `--hunk-headers` / `--no-hunk-headers` | Show / hide `@@` hunk headers |
@@ -155,7 +156,7 @@ with CLI flags taking precedence:
 
 ```toml
 theme = "auto"          # "auto", or any built-in / custom theme name
-mode = "auto"           # "auto", "split", "stack"
+mode = "auto"           # "auto", "split", "stack", "vertical"
 line_numbers = true
 wrap_lines = false
 hunk_headers = true
