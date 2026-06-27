@@ -7,7 +7,11 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -154,7 +158,7 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
 
     // `ratatui::init` installs a panic hook that restores the terminal, so a
     // crash mid-render won't leave the user in a broken alternate screen.
-    let mut terminal = ratatui::init();
+    let mut terminal = init_review_terminal();
     let result = run_loop(
         &mut terminal,
         &model,
@@ -164,8 +168,32 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
         wrap,
         config.mode,
     );
-    ratatui::restore();
+    restore_review_terminal();
     result
+}
+
+/// Enter the review UI: ratatui's alternate screen + raw mode, plus mouse
+/// capture so the wheel scrolls the diff. Capture routes mouse events to the
+/// app, so the terminal's own click-drag text selection is suspended while
+/// reviewing (most terminals still select on Shift+drag).
+///
+/// ponytail: the panic hook ratatui installs restores the screen but not mouse
+/// capture, so a panic can leave capture on. Acceptable — a crash is rare and
+/// the next program's init resets it; wire a custom hook only if it bites.
+fn init_review_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    // Best-effort: a terminal that rejects mouse capture just won't wheel-scroll;
+    // the keyboard path is unaffected.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    terminal
+}
+
+/// Leave the review UI: disable mouse capture, then restore the normal screen
+/// and cooked mode, handing the terminal back clean to the shell, `$EDITOR`, or
+/// the exiting process. Mirrors [`init_review_terminal`].
+fn restore_review_terminal() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
 }
 
 /// Redirect `/dev/tty` onto stdin (fd 0) so the interactive loop can read key
@@ -368,7 +396,16 @@ fn run_loop(
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        if let Event::Key(key) = event::read()? {
+        let ev = event::read()?;
+        // Mouse wheel scrolls the diff vertically (capture is enabled in
+        // `init_review_terminal`). Other mouse events are ignored for now.
+        if let Event::Mouse(me) = &ev {
+            if let Some(new_offset) = wheel_scroll(me.kind, offset, WHEEL_LINES, max_offset) {
+                offset = new_offset;
+            }
+            continue;
+        }
+        if let Event::Key(key) = ev {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -616,15 +653,16 @@ fn open_in_editor(terminal: &mut DefaultTerminal, path: &str) {
     let editor = std::env::var("EDITOR").ok();
     let (program, args) = editor_command(visual.as_deref(), editor.as_deref());
 
-    // Leave the alternate screen + raw mode so the editor owns the terminal.
-    ratatui::restore();
+    // Leave the alternate screen + raw mode (and mouse capture) so the editor
+    // owns the terminal.
+    restore_review_terminal();
     let _ = std::process::Command::new(&program)
         .args(&args)
         .arg(path)
         .status();
     // Re-enter our UI regardless of how (or whether) the editor ran. The next
     // loop iteration redraws.
-    *terminal = ratatui::init();
+    *terminal = init_review_terminal();
 }
 
 /// Suspend the process to the shell (Ctrl-Z semantics) with the terminal
@@ -636,12 +674,12 @@ fn suspend_and_resume(terminal: &mut DefaultTerminal) {
     use rustix::process::{getpid, kill_process, Signal};
 
     // Hand the terminal back in a sane state before stopping.
-    ratatui::restore();
+    restore_review_terminal();
     // Stop ourselves; control returns to the shell. Best-effort — if the signal
     // cannot be raised we simply re-enter below rather than hanging.
     let _ = kill_process(getpid(), Signal::Tstp);
     // Foregrounded again: re-enter the alternate screen; the loop redraws.
-    *terminal = ratatui::init();
+    *terminal = init_review_terminal();
 }
 
 /// Everything `draw_review` needs to paint one frame. Bundled so the live loop
@@ -835,6 +873,20 @@ fn h_scroll_offset(key: KeyCode, h: u16, step: u16, max: u16, wrap: bool) -> Opt
     match key {
         KeyCode::Right => Some((h + step).min(max)),
         KeyCode::Left => Some(h.saturating_sub(step)),
+        _ => None,
+    }
+}
+
+/// Lines the mouse wheel scrolls per notch.
+const WHEEL_LINES: u16 = 3;
+
+/// New vertical offset for a mouse-wheel event, or `None` when the event isn't a
+/// scroll (so the caller ignores it). Pure, mirroring `scroll_offset`, so the
+/// wheel mapping is unit-testable without a terminal.
+fn wheel_scroll(kind: MouseEventKind, offset: u16, step: u16, max_offset: u16) -> Option<u16> {
+    match kind {
+        MouseEventKind::ScrollDown => Some((offset + step).min(max_offset)),
+        MouseEventKind::ScrollUp => Some(offset.saturating_sub(step)),
         _ => None,
     }
 }
@@ -1401,6 +1453,17 @@ index 5555555..6666666 100644
         );
         // With no hunks, `{`/`}` are not handled (return None).
         assert_eq!(scroll_offset(KeyCode::Char('}'), 0, 10, 100, fs, &[]), None);
+    }
+
+    #[test]
+    fn wheel_scroll_maps_scroll_events_and_ignores_others() {
+        use ratatui::crossterm::event::MouseEventKind;
+        // Down advances by step, clamped at max; Up backs off toward 0.
+        assert_eq!(wheel_scroll(MouseEventKind::ScrollDown, 0, 3, 10), Some(3));
+        assert_eq!(wheel_scroll(MouseEventKind::ScrollDown, 9, 3, 10), Some(10));
+        assert_eq!(wheel_scroll(MouseEventKind::ScrollUp, 2, 3, 10), Some(0));
+        // A non-scroll mouse event (e.g. a move) is not handled here.
+        assert_eq!(wheel_scroll(MouseEventKind::Moved, 5, 3, 10), None);
     }
 
     #[test]
