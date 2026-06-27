@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-26
+
 ### Added
 
 - Display flags now work on every diff-rendering subcommand, not just `diff`:
@@ -16,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Contributor tooling: a `justfile` mirroring the CI gates (`just check`), a
   pinned `rust-toolchain.toml`, and `CONTRIBUTING.md` (#39); this `CHANGELOG.md`
   and a `SECURITY.md` policy; module-level API docs and a CI `cargo doc` gate (#38).
+- A complete CLI options reference in the README, covering every flag including
+  `-V`/`--version` (#47).
 
 ### Fixed
 
@@ -67,7 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection; configuration via `~/.config/revu/config.toml` and a repo-local
   `.revu/config.toml`. No telemetry and zero network calls.
 
-[Unreleased]: https://github.com/lgbarn/revu/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/lgbarn/revu/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/lgbarn/revu/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/lgbarn/revu/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/lgbarn/revu/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lgbarn/revu/compare/v0.1.1...v0.1.2
