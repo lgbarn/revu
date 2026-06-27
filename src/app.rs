@@ -276,6 +276,7 @@ fn effective_mode(mode: &str, width: u16) -> LayoutMode {
     match mode {
         "split" => LayoutMode::Split,
         "stack" | "unified" => LayoutMode::Stack,
+        "vertical" => LayoutMode::Vertical,
         _ => {
             if width >= AUTO_SPLIT_MIN {
                 LayoutMode::Split
@@ -367,10 +368,12 @@ fn run_loop(
         let main_width = main_content_width(term_width, sidebar_visible);
         let eff_mode = effective_mode(&mode, main_width);
         // Rebuild lines only when something that affects them changed: a toggle
-        // (needs_render), the layout mode, or — for split — the column width.
+        // (needs_render), the layout mode, or — for the width-dependent layouts
+        // (split's columns, vertical's full-width cells + rule) — the width.
+        let width_dependent = matches!(eff_mode, LayoutMode::Split | LayoutMode::Vertical);
         if needs_render
             || cur_mode != Some(eff_mode)
-            || (eff_mode == LayoutMode::Split && main_width != cur_width)
+            || (width_dependent && main_width != cur_width)
         {
             opts.mode = eff_mode;
             let r = render_diff(
@@ -632,12 +635,14 @@ fn run_loop(
                     expanded_folds.clear();
                     needs_render = true;
                 }
-                // Cycle the layout mode auto -> split -> stack -> auto. The next
-                // loop iteration re-resolves the effective mode and re-renders.
+                // Cycle the layout auto -> split -> stack -> vertical -> auto.
+                // The next loop iteration re-resolves the effective mode and
+                // re-renders.
                 KeyCode::Char('m') => {
                     mode = match mode.as_str() {
                         "auto" => "split".to_string(),
                         "split" => "stack".to_string(),
+                        "stack" | "unified" => "vertical".to_string(),
                         _ => "auto".to_string(),
                     };
                     needs_render = true;
@@ -1117,11 +1122,13 @@ fn status_bar(
     };
 
     // Show only the toggles that are currently ON, mirroring the help labels.
-    // SPLIT is shown only when the side-by-side layout is active; in the default
-    // stack layout the mode is implicit (and the indicator stays absent).
+    // A layout chip is shown for the non-default layouts; the default stack
+    // layout stays implicit (no indicator).
     let mut active: Vec<&str> = Vec::new();
-    if opts.mode == LayoutMode::Split {
-        active.push("SPLIT");
+    match opts.mode {
+        LayoutMode::Split => active.push("SPLIT"),
+        LayoutMode::Vertical => active.push("VERT"),
+        LayoutMode::Stack => {}
     }
     if opts.line_numbers {
         active.push("LN");
@@ -1187,7 +1194,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  o / Enter   toggle fold",
         "  O   expand all folds",
         "  C   collapse all folds",
-        "  m   cycle layout auto/split/stack",
+        "  m   cycle layout auto/split/stack/vertical",
         "  t   theme selector",
         "",
         "  e   open file in $EDITOR",
@@ -1384,6 +1391,7 @@ index 5555555..6666666 100644
         assert_eq!(effective_mode("split", 1), LayoutMode::Split);
         assert_eq!(effective_mode("stack", 9999), LayoutMode::Stack);
         assert_eq!(effective_mode("unified", 9999), LayoutMode::Stack);
+        assert_eq!(effective_mode("vertical", 1), LayoutMode::Vertical);
         // Auto (and unknown values) switch at AUTO_SPLIT_MIN.
         assert_eq!(
             effective_mode("auto", AUTO_SPLIT_MIN - 1),

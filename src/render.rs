@@ -23,6 +23,9 @@ pub enum LayoutMode {
     Stack,
     /// Side-by-side: old on the left, new on the right, aligned per row.
     Split,
+    /// Top/bottom: per hunk, the old block stacked above the new block, each
+    /// full width. Useful on narrow-but-tall terminals where split is cramped.
+    Vertical,
 }
 
 /// Display toggles that change what `render_lines` emits. Distinct from the
@@ -181,6 +184,7 @@ fn layout_rows(
         // folds); folding its paired change-groups is a later add. It does honor
         // whole-file generated-file collapse, so noise files fold in both layouts.
         LayoutMode::Split => split_rows(model, highlighter, theme, opts, folds, width),
+        LayoutMode::Vertical => vertical_rows(model, highlighter, theme, opts, folds, width),
     }
 }
 
@@ -615,6 +619,97 @@ fn split_rows(
                     };
                     out.push(compose_row(left, right, theme));
                 }
+            }
+        }
+
+        out.push(Line::from(""));
+    }
+    RenderedDiff {
+        lines: out,
+        file_starts,
+        hunk_starts,
+        fold_bars,
+    }
+}
+
+/// The vertical (top/bottom) layout: per hunk, the old block (context + removes)
+/// stacked above the new block (context + adds), each rendered full width with a
+/// dim rule between them. Reuses [`build_cell`] for the per-line rendering, so a
+/// row looks exactly like one side of the split layout. Line numbers stay
+/// correct because the old counter advances on context+remove and the new on
+/// context+add — the same as the interleaved walk, just split into two passes.
+fn vertical_rows(
+    model: &DiffModel,
+    highlighter: &Highlighter,
+    theme: &Theme,
+    opts: &RenderOptions,
+    folds: &HashSet<FoldId>,
+    width: u16,
+) -> RenderedDiff {
+    let full_w = width.max(1) as usize;
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
+    let mut hunk_starts: Vec<usize> = Vec::new();
+    let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
+    for (file_idx, file) in model.files.iter().enumerate() {
+        file_starts.push(out.len());
+        push_file_header(&mut out, file, theme);
+
+        let file_collapsed =
+            file_collapse_bar(&mut out, &mut fold_bars, file, file_idx, folds, theme);
+
+        let syntax = highlighter.syntax_for_path(&file.path);
+
+        for hunk in &file.hunks {
+            if file_collapsed {
+                break;
+            }
+            hunk_starts.push(out.len());
+            push_hunk_header(&mut out, hunk, opts, theme);
+
+            let mut old_line = parse_hunk_old_start(&hunk.header);
+            let mut new_line = parse_hunk_new_start(&hunk.header);
+
+            // Pre-highlight in order so syntect's token state matches stack/split.
+            let mut hl = highlighter.line_highlighter(syntax);
+            let highlighted: Vec<Vec<(Color, String)>> = hunk
+                .lines
+                .iter()
+                .map(|dl| highlighter.highlight_line(&mut hl, &dl.content))
+                .collect();
+
+            // Old block: context + removes, numbered on the old side.
+            let mut old_emitted = 0usize;
+            for (i, dl) in hunk.lines.iter().enumerate() {
+                if dl.kind == LineKind::Add {
+                    continue;
+                }
+                let cell = build_cell(dl, &highlighted[i], old_line, theme, opts, full_w);
+                out.push(Line::from(cell));
+                old_line = old_line.map(|n| n + 1);
+                old_emitted += 1;
+            }
+            // Dim rule between the blocks — only when BOTH are non-empty, so a
+            // pure-add or pure-delete hunk doesn't leave a rule floating against
+            // an empty side.
+            let new_nonempty = hunk.lines.iter().any(|dl| dl.kind != LineKind::Remove);
+            if old_emitted > 0 && new_nonempty {
+                out.push(Line::from(Span::styled(
+                    "─".repeat(full_w),
+                    Style::default()
+                        .fg(theme.gutter)
+                        .add_modifier(Modifier::DIM),
+                )));
+            }
+            // New block: context + adds, numbered on the new side.
+            for (i, dl) in hunk.lines.iter().enumerate() {
+                if dl.kind == LineKind::Remove {
+                    continue;
+                }
+                let cell = build_cell(dl, &highlighted[i], new_line, theme, opts, full_w);
+                out.push(Line::from(cell));
+                new_line = new_line.map(|n| n + 1);
             }
         }
 
@@ -1865,6 +1960,77 @@ index 1111111..2222222 100644
                 .iter()
                 .any(|l| l.contains("version =")),
             "body shown once the file fold is expanded"
+        );
+    }
+
+    #[test]
+    fn vertical_layout_stacks_old_block_above_new_block() {
+        let model = parse_unified_diff(SAMPLE);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions {
+            mode: LayoutMode::Vertical,
+            ..RenderOptions::default()
+        };
+        let r = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            60,
+        );
+        let text = flatten(&r.lines);
+        let find = |needle: &str| text.iter().position(|l| l.contains(needle));
+        let old_pos = find("old\")").expect("removed line in the old block");
+        let new_pos = find("new\")").expect("added line in the new block");
+        let sep_pos = find("───").expect("dim rule between the blocks");
+        assert!(
+            old_pos < sep_pos && sep_pos < new_pos,
+            "old block, then rule, then new block: old={old_pos} sep={sep_pos} new={new_pos}"
+        );
+        // The added line must not appear above the separator (it's new-side only).
+        assert!(
+            !text[..sep_pos].iter().any(|l| l.contains("added line")),
+            "added line must not be in the old block"
+        );
+    }
+
+    #[test]
+    fn vertical_pure_add_hunk_omits_the_dim_rule() {
+        // A hunk with only added lines (no context, no removes) must not leave a
+        // dim rule floating above an empty old block.
+        let add_only = "\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++line one
++line two
+";
+        let model = parse_unified_diff(add_only);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions {
+            mode: LayoutMode::Vertical,
+            ..RenderOptions::default()
+        };
+        let r = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            60,
+        );
+        let text = flatten(&r.lines);
+        assert!(
+            text.iter().any(|l| l.contains("line one")),
+            "added lines render"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("───")),
+            "no dim rule for a pure-add hunk: {text:?}"
         );
     }
 
