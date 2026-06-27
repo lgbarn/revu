@@ -619,6 +619,7 @@ fn run_loop(
                             summaries = file_summaries(&model);
                             file_count = model.files.len();
                             offset = 0;
+                            h_offset = 0;
                             expanded_folds.clear();
                             search = None;
                             needs_render = true;
