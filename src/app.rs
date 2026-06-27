@@ -484,7 +484,7 @@ fn run_loop(
                 if recompute {
                     let q = search_input.clone().unwrap_or_default();
                     let s = Search::new(q, &line_texts);
-                    jump_to_match(&s, &mut offset, max_offset);
+                    jump_to_match(&s, &mut offset, &mut h_offset, max_offset);
                     search = Some(s);
                 }
                 continue;
@@ -549,7 +549,7 @@ fn run_loop(
                 KeyCode::Char('N') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.prev();
-                        jump_to_match(s, &mut offset, max_offset);
+                        jump_to_match(s, &mut offset, &mut h_offset, max_offset);
                     }
                 }
                 // Display toggles: flip the option and re-render the lines.
@@ -558,7 +558,7 @@ fn run_loop(
                 KeyCode::Char('n') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.next();
-                        jump_to_match(s, &mut offset, max_offset);
+                        jump_to_match(s, &mut offset, &mut h_offset, max_offset);
                     } else {
                         opts.line_numbers = !opts.line_numbers;
                         needs_render = true;
@@ -914,10 +914,12 @@ fn match_offset(m: Match, max_offset: u16) -> u16 {
 }
 
 /// After the search cursor moves, scroll so the current match sits at the
-/// viewport top (clamped). No-op when the search matched nothing.
-fn jump_to_match(search: &Search, offset: &mut u16, max_offset: u16) {
+/// viewport top (clamped) and reset the horizontal offset so the match isn't
+/// scrolled off-screen to the left. No-op when the search matched nothing.
+fn jump_to_match(search: &Search, offset: &mut u16, h_offset: &mut u16, max_offset: u16) {
     if let Some(m) = search.current_match() {
         *offset = match_offset(m, max_offset);
+        *h_offset = 0;
     }
 }
 
