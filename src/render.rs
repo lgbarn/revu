@@ -680,6 +680,7 @@ fn vertical_rows(
                 .collect();
 
             // Old block: context + removes, numbered on the old side.
+            let mut old_emitted = 0usize;
             for (i, dl) in hunk.lines.iter().enumerate() {
                 if dl.kind == LineKind::Add {
                     continue;
@@ -687,14 +688,20 @@ fn vertical_rows(
                 let cell = build_cell(dl, &highlighted[i], old_line, theme, opts, full_w);
                 out.push(Line::from(cell));
                 old_line = old_line.map(|n| n + 1);
+                old_emitted += 1;
             }
-            // Dim rule separating the old block from the new block.
-            out.push(Line::from(Span::styled(
-                "─".repeat(full_w),
-                Style::default()
-                    .fg(theme.gutter)
-                    .add_modifier(Modifier::DIM),
-            )));
+            // Dim rule between the blocks — only when BOTH are non-empty, so a
+            // pure-add or pure-delete hunk doesn't leave a rule floating against
+            // an empty side.
+            let new_nonempty = hunk.lines.iter().any(|dl| dl.kind != LineKind::Remove);
+            if old_emitted > 0 && new_nonempty {
+                out.push(Line::from(Span::styled(
+                    "─".repeat(full_w),
+                    Style::default()
+                        .fg(theme.gutter)
+                        .add_modifier(Modifier::DIM),
+                )));
+            }
             // New block: context + adds, numbered on the new side.
             for (i, dl) in hunk.lines.iter().enumerate() {
                 if dl.kind == LineKind::Remove {
@@ -1985,6 +1992,45 @@ index 1111111..2222222 100644
         assert!(
             !text[..sep_pos].iter().any(|l| l.contains("added line")),
             "added line must not be in the old block"
+        );
+    }
+
+    #[test]
+    fn vertical_pure_add_hunk_omits_the_dim_rule() {
+        // A hunk with only added lines (no context, no removes) must not leave a
+        // dim rule floating above an empty old block.
+        let add_only = "\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++line one
++line two
+";
+        let model = parse_unified_diff(add_only);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions {
+            mode: LayoutMode::Vertical,
+            ..RenderOptions::default()
+        };
+        let r = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            60,
+        );
+        let text = flatten(&r.lines);
+        assert!(
+            text.iter().any(|l| l.contains("line one")),
+            "added lines render"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("───")),
+            "no dim rule for a pure-add hunk: {text:?}"
         );
     }
 

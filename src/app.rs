@@ -368,10 +368,12 @@ fn run_loop(
         let main_width = main_content_width(term_width, sidebar_visible);
         let eff_mode = effective_mode(&mode, main_width);
         // Rebuild lines only when something that affects them changed: a toggle
-        // (needs_render), the layout mode, or — for split — the column width.
+        // (needs_render), the layout mode, or — for the width-dependent layouts
+        // (split's columns, vertical's full-width cells + rule) — the width.
+        let width_dependent = matches!(eff_mode, LayoutMode::Split | LayoutMode::Vertical);
         if needs_render
             || cur_mode != Some(eff_mode)
-            || (eff_mode == LayoutMode::Split && main_width != cur_width)
+            || (width_dependent && main_width != cur_width)
         {
             opts.mode = eff_mode;
             let r = render_diff(
@@ -1120,11 +1122,13 @@ fn status_bar(
     };
 
     // Show only the toggles that are currently ON, mirroring the help labels.
-    // SPLIT is shown only when the side-by-side layout is active; in the default
-    // stack layout the mode is implicit (and the indicator stays absent).
+    // A layout chip is shown for the non-default layouts; the default stack
+    // layout stays implicit (no indicator).
     let mut active: Vec<&str> = Vec::new();
-    if opts.mode == LayoutMode::Split {
-        active.push("SPLIT");
+    match opts.mode {
+        LayoutMode::Split => active.push("SPLIT"),
+        LayoutMode::Vertical => active.push("VERT"),
+        LayoutMode::Stack => {}
     }
     if opts.line_numbers {
         active.push("LN");
