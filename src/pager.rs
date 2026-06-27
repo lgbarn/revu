@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::app;
 use crate::config::ConfigOverrides;
+use crate::live::DiffSource;
 
 /// Where a `patch` review should read its input from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub fn run_pager(overrides: ConfigOverrides) -> Result<()> {
         // Display flags from the CLI apply to the diff view; config + state.json
         // still layer underneath. Non-diff input goes to a plain pager below.
         // No reload: the diff arrived on stdin and cannot be re-fetched.
-        app::review_text(&text, &overrides, None, false)
+        app::review_text(&text, &overrides, None, false, DiffSource::Stdin)
     } else {
         spawn_text_pager(&bytes)
     }
@@ -45,7 +46,7 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
             std::io::stdin()
                 .read_to_string(&mut s)
                 .context("failed to read patch from stdin")?;
-            app::review_text(&s, &overrides, None, false)
+            app::review_text(&s, &overrides, None, false, DiffSource::Stdin)
         }
         PatchSource::File(path) => {
             // A patch file CAN be re-read, so `r` reloads it from disk.
@@ -54,7 +55,8 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
                     .with_context(|| format!("failed to read patch file `{path}`"))
             });
             let text = fetch()?;
-            app::review_text(&text, &overrides, Some(fetch), false)
+            // A patch file is re-fetchable for `r` but not auto-polled.
+            app::review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
         }
     }
 }
