@@ -3,7 +3,7 @@
 //! This is a pure function over the model, so the same output that the live UI
 //! draws can be snapshot-tested against an in-memory buffer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -80,6 +80,11 @@ pub struct RenderedDiff {
     /// A collapsed generated file contributes none (its hunks aren't emitted).
     pub hunk_starts: Vec<usize>,
     pub fold_bars: Vec<(usize, FoldId)>,
+    /// Rendered ROW index -> `(file index, new-side line number)` for each
+    /// content line that exists on the new side (context + adds), so the app can
+    /// render an optional blame gutter aligned to those rows. Only the stack
+    /// layout populates this; split/vertical leave it empty.
+    pub blame_keys: HashMap<usize, (usize, usize)>,
 }
 
 /// One row of the file sidebar: a path with its add/remove line counts.
@@ -176,6 +181,7 @@ fn layout_rows(
             file_starts: Vec::new(),
             hunk_starts: Vec::new(),
             fold_bars: Vec::new(),
+            blame_keys: HashMap::new(),
         };
     }
     match opts.mode {
@@ -275,6 +281,8 @@ fn stack_rows(
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
     // Row where each hunk begins, ascending; drives `{`/`}` hunk navigation.
     let mut hunk_starts: Vec<usize> = Vec::new();
+    // Row -> (file index, new-side line number) for the optional blame gutter.
+    let mut blame_keys: HashMap<usize, (usize, usize)> = HashMap::new();
     // Row -> FoldId for every emitted fold bar, ascending by row (we append top
     // to bottom). The app uses this to find the fold nearest the viewport.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
@@ -420,6 +428,13 @@ fn stack_rows(
                         pad_to_width(&mut spans, width as usize);
                         apply_row_bg(&mut spans, bg);
                     }
+                    // Record the blame key for lines that exist on the new side
+                    // (context + adds), keyed by this row, before the push.
+                    if let Some(n) = new_line {
+                        if dl.kind != LineKind::Remove {
+                            blame_keys.insert(out.len(), (file_idx, n));
+                        }
+                    }
                     out.push(Line::from(spans));
                 }
 
@@ -443,6 +458,7 @@ fn stack_rows(
         file_starts,
         hunk_starts,
         fold_bars,
+        blame_keys,
     }
 }
 
@@ -629,6 +645,8 @@ fn split_rows(
         file_starts,
         hunk_starts,
         fold_bars,
+        // Blame gutter is stack-only; split/vertical render no blame keys.
+        blame_keys: HashMap::new(),
     }
 }
 
@@ -720,6 +738,8 @@ fn vertical_rows(
         file_starts,
         hunk_starts,
         fold_bars,
+        // Blame gutter is stack-only; split/vertical render no blame keys.
+        blame_keys: HashMap::new(),
     }
 }
 
@@ -2032,6 +2052,32 @@ index 0000000..1111111
             !text.iter().any(|l| l.contains("───")),
             "no dim rule for a pure-add hunk: {text:?}"
         );
+    }
+
+    #[test]
+    fn stack_blame_keys_map_new_side_content_rows() {
+        let model = parse_unified_diff(SAMPLE);
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions::default(); // stack
+        let r = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            80,
+        );
+        // SAMPLE's hunk has 4 new-side lines (2 context + 2 adds); the single
+        // removed line has no new-side number, so it gets no blame key.
+        assert_eq!(r.blame_keys.len(), 4);
+        for (file, newline) in r.blame_keys.values() {
+            assert_eq!(*file, 0);
+            assert!(*newline >= 1);
+        }
+        // The new-side line numbers are exactly 1..=4.
+        let mut nums: Vec<usize> = r.blame_keys.values().map(|&(_, n)| n).collect();
+        nums.sort_unstable();
+        assert_eq!(nums, vec![1, 2, 3, 4]);
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub fn run_pager(overrides: ConfigOverrides) -> Result<()> {
         // Display flags from the CLI apply to the diff view; config + state.json
         // still layer underneath. Non-diff input goes to a plain pager below.
         // No reload: the diff arrived on stdin and cannot be re-fetched.
-        app::review_text(&text, &overrides, None)
+        app::review_text(&text, &overrides, None, false)
     } else {
         spawn_text_pager(&bytes)
     }
@@ -45,7 +45,7 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
             std::io::stdin()
                 .read_to_string(&mut s)
                 .context("failed to read patch from stdin")?;
-            app::review_text(&s, &overrides, None)
+            app::review_text(&s, &overrides, None, false)
         }
         PatchSource::File(path) => {
             // A patch file CAN be re-read, so `r` reloads it from disk.
@@ -54,7 +54,7 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
                     .with_context(|| format!("failed to read patch file `{path}`"))
             });
             let text = fetch()?;
-            app::review_text(&text, &overrides, Some(fetch))
+            app::review_text(&text, &overrides, Some(fetch), false)
         }
     }
 }

@@ -6,10 +6,6 @@
 //! renders it interactively (`render`).
 
 mod app;
-// ponytail: the parser + adapter method land first, fully tested; they are
-// wired into the `B` blame-gutter render in the follow-up integration (#53), so
-// they read as dead code until then. Allowed deliberately, not by oversight.
-#[allow(dead_code)]
 mod blame;
 mod cli;
 mod config;

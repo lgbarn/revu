@@ -1,7 +1,7 @@
 //! Terminal setup and the interactive review loop shared by `diff`, `pager`,
 //! and `patch` (via [`review_text`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -51,7 +51,8 @@ pub fn run_diff(
     if let Some(number) = pr {
         let fetch: ReloadFn = Box::new(move || gh_pr_diff(number));
         let diff_text = fetch()?;
-        return review_text(&diff_text, &overrides, Some(fetch));
+        // A PR's new side isn't the local working tree, so blame is disabled.
+        return review_text(&diff_text, &overrides, Some(fetch), false);
     }
 
     // Build a closure that (re-)fetches the diff, so the initial load and the
@@ -79,7 +80,11 @@ pub fn run_diff(
         })
     };
     let diff_text = fetch()?;
-    review_text(&diff_text, &overrides, Some(fetch))
+    // Blame (`git blame` of the working tree) maps cleanly only to an unstaged
+    // working-tree diff. Two-file and staged diffs have a different new side, so
+    // blame is disabled there to avoid showing the wrong revision's authorship.
+    let blame_enabled = !two_file && !staged;
+    review_text(&diff_text, &overrides, Some(fetch), blame_enabled)
 }
 
 /// The argv (after the `gh` program name) that fetches PR `number`'s diff.
@@ -123,7 +128,8 @@ pub fn run_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> 
         adapter.revision_show(&reff)
     });
     let text = fetch()?;
-    review_text(&text, &overrides, Some(fetch))
+    // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
+    review_text(&text, &overrides, Some(fetch), false)
 }
 
 /// Review a stash entry. `reff` defaults to `stash@{0}` (the latest stash).
@@ -138,7 +144,8 @@ pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Resul
         adapter.stash_show(&reff)
     });
     let text = fetch()?;
-    review_text(&text, &overrides, Some(fetch))
+    // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
+    review_text(&text, &overrides, Some(fetch), false)
 }
 
 /// `revu difftool <left> <right> [path]`: render the diff between two file
@@ -158,7 +165,8 @@ pub fn run_difftool(
 ) -> Result<()> {
     let fetch: ReloadFn = Box::new(move || GitAdapter::new().diff_files(&left, &right));
     let text = fetch()?;
-    review_text(&text, &overrides, Some(fetch))
+    // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
+    review_text(&text, &overrides, Some(fetch), false)
 }
 
 /// Re-fetches the diff text from its original source on demand (the `r` reload
@@ -185,6 +193,7 @@ pub fn review_text(
     diff_text: &str,
     overrides: &ConfigOverrides,
     reload: Option<ReloadFn>,
+    blame_enabled: bool,
 ) -> Result<()> {
     let model = build_model(diff_text);
 
@@ -245,6 +254,7 @@ pub fn review_text(
         wrap,
         config.mode,
         reload,
+        blame_enabled,
     );
     restore_review_terminal();
     result
@@ -336,10 +346,10 @@ fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
 /// options so display toggles can RE-RENDER the lines in place (rather than
 /// re-running the whole pipeline). Persists the final toggle state to
 /// `state.json` on quit.
-// ponytail: eight distinct loop inputs (terminal, model, the four view-state
-// values, mode, reload) — all genuinely separate; bundling them into a struct
-// would be artificial indirection, so the lint is allowed here rather than
-// worked around.
+// ponytail: nine distinct loop inputs (terminal, model, the four view-state
+// values, mode, reload, blame flag) — all genuinely separate; bundling them
+// into a struct would be artificial indirection, so the lint is allowed here
+// rather than worked around.
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut DefaultTerminal,
@@ -350,8 +360,19 @@ fn run_loop(
     mut wrap: bool,
     mut mode: String,
     reload: Option<ReloadFn>,
+    blame_enabled: bool,
 ) -> Result<()> {
     let mut file_count = model.files.len();
+    // Blame gutter (`B`): off until toggled; `blame_cache` maps a file index to
+    // its `git blame` of the working tree, fetched lazily on first toggle and
+    // reused. `blame_now` stamps the relative ages. Only meaningful when
+    // `blame_enabled` (an unstaged working-tree diff).
+    let mut blame_on = false;
+    let mut blame_cache: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
+    let blame_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     // The curated catalog the theme selector cycles through. The active theme's
     // index seeds the selector cursor (or 0 when a custom theme isn't in it).
     let catalog = theme::catalog();
@@ -372,6 +393,8 @@ fn run_loop(
     // Row -> FoldId for the fold bars in the current render, ascending by row.
     // Rebuilt every render alongside `lines`; the `o`/Enter toggle reads it.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
+    // Row -> (file index, new-side line) for the blame gutter, rebuilt per render.
+    let mut blame_keys: HashMap<usize, (usize, usize)> = HashMap::new();
     // The folds the user has expanded. Empty = every fold collapsed (the default
     // view). A render toggle (like the display toggles) re-renders when it changes.
     let mut expanded_folds: HashSet<FoldId> = HashSet::new();
@@ -438,6 +461,7 @@ fn run_loop(
             file_starts = r.file_starts;
             hunk_starts = r.hunk_starts;
             fold_bars = r.fold_bars;
+            blame_keys = r.blame_keys;
             cur_mode = Some(eff_mode);
             cur_width = main_width;
             needs_render = false;
@@ -483,6 +507,10 @@ fn run_loop(
             search_status,
             selection,
             copy_notice: copy_notice.clone(),
+            blame_on,
+            blame_cache: &blame_cache,
+            blame_keys: &blame_keys,
+            blame_now,
         };
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
@@ -779,6 +807,20 @@ fn run_loop(
                 // Sidebar visibility toggle. (Tab/BackTab and `[`/`]` file
                 // navigation are handled by `scroll_offset` above.)
                 KeyCode::Char('s') => sidebar_visible = !sidebar_visible,
+                // Toggle the blame gutter (only for an unstaged working-tree
+                // diff). On first turn-on, fetch `git blame` for each file once
+                // and cache it; subsequent toggles reuse the cache.
+                KeyCode::Char('B') if blame_enabled => {
+                    blame_on = !blame_on;
+                    if blame_on && blame_cache.is_empty() {
+                        let adapter = GitAdapter::new();
+                        for (idx, summary) in summaries.iter().enumerate() {
+                            if let Ok(porcelain) = adapter.blame(None, &summary.path) {
+                                blame_cache.insert(idx, crate::blame::parse_blame(&porcelain));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -890,6 +932,14 @@ struct ReviewFrame<'a> {
     selection: Option<(usize, usize)>,
     /// Transient "copied N lines" notice shown in the status bar after a copy.
     copy_notice: Option<String>,
+    /// Whether the blame gutter is shown (stack layout only).
+    blame_on: bool,
+    /// Per-file `git blame`, indexed by file then new-side line (0-based).
+    blame_cache: &'a HashMap<usize, Vec<crate::blame::BlameLine>>,
+    /// Row -> (file index, new-side line number) for blame-gutter alignment.
+    blame_keys: &'a HashMap<usize, (usize, usize)>,
+    /// Epoch seconds used to render relative blame ages.
+    blame_now: i64,
 }
 
 /// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
@@ -911,6 +961,20 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
         panes[1]
     } else {
         body
+    };
+
+    // Optional blame gutter: a fixed-width column at the left of the main area,
+    // scrolled in sync with the diff so each row lines up. Stack layout only
+    // (split/vertical leave `blame_keys` empty, so this is skipped there).
+    const BLAME_W: u16 = 18;
+    let main = if v.blame_on && !v.blame_keys.is_empty() && main.width > BLAME_W + 10 {
+        let cols =
+            Layout::horizontal([Constraint::Length(BLAME_W), Constraint::Min(0)]).split(main);
+        let gutter = blame_gutter_lines(v, BLAME_W as usize);
+        frame.render_widget(Paragraph::new(gutter).scroll((v.offset, 0)), cols[0]);
+        cols[1]
+    } else {
+        main
     };
 
     // ponytail: clone per frame is wasteful for huge diffs; revisit if it ever
@@ -1090,6 +1154,52 @@ fn write_osc52_copy(text: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout();
     out.write_all(osc::osc52_copy(text).as_bytes())?;
     out.flush()
+}
+
+/// One `width`-column blame cell for rendered row `row`: `author age`, dim, or
+/// blanks when the row has no new-side line / no blame for that file. Pure given
+/// the frame's blame data, so the column logic is unit-testable.
+fn blame_cell(v: &ReviewFrame, row: usize, width: usize) -> String {
+    let blank = " ".repeat(width);
+    let Some(&(file, line)) = v.blame_keys.get(&row) else {
+        return blank;
+    };
+    let Some(bl) = v
+        .blame_cache
+        .get(&file)
+        .and_then(|b| b.get(line.saturating_sub(1)))
+    else {
+        return blank;
+    };
+    let age = crate::blame::relative_age(bl.time, v.blame_now);
+    format_blame_cell(&bl.author, &age, width)
+}
+
+/// Lay out one blame cell as `author age` in exactly `width` columns: the author
+/// is left-aligned and truncated to leave room for a space and the age; the
+/// whole thing is padded or clamped to `width`. Pure, so it is unit-testable.
+fn format_blame_cell(author: &str, age: &str, width: usize) -> String {
+    let age_w = age.chars().count();
+    let author_w = width.saturating_sub(age_w + 1).max(1);
+    let author: String = author.chars().take(author_w).collect();
+    let cell = format!("{author:<author_w$} {age}");
+    let len = cell.chars().count();
+    if len < width {
+        format!("{cell}{}", " ".repeat(width - len))
+    } else {
+        cell.chars().take(width).collect()
+    }
+}
+
+/// The blame gutter as one `Line` per rendered row (parallel to `v.lines`), so a
+/// `Paragraph` scrolled by the same offset lines up with the diff.
+fn blame_gutter_lines(v: &ReviewFrame, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default()
+        .fg(v.theme.gutter)
+        .add_modifier(Modifier::DIM);
+    (0..v.lines.len())
+        .map(|row| Line::from(Span::styled(blame_cell(v, row, width), dim)))
+        .collect()
 }
 
 /// Map a selected file index to a clamped scroll offset for the main view.
@@ -1347,6 +1457,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "",
         "  e   open file in $EDITOR",
         "  r   reload the diff from its source",
+        "  B   blame gutter (working-tree diff)",
         "  drag   select lines; release copies (OSC52)",
         "  Ctrl-Z suspend  Ctrl-C quit",
         "",
@@ -1503,6 +1614,8 @@ index 5555555..6666666 100644
         // Select the second file and scroll the main view to its start.
         let selected_file = 1;
         let offset = rendered.file_starts[selected_file] as u16;
+        let blame_empty: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
+        let blame_keys_empty: HashMap<usize, (usize, usize)> = HashMap::new();
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
@@ -1524,6 +1637,10 @@ index 5555555..6666666 100644
             search_status: None,
             selection: None,
             copy_notice: None,
+            blame_on: false,
+            blame_cache: &blame_empty,
+            blame_keys: &blame_keys_empty,
+            blame_now: 0,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -1535,6 +1652,75 @@ index 5555555..6666666 100644
             .unwrap();
 
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn blame_gutter_renders_the_author_when_on() {
+        let model = parse_unified_diff_colored(MULTI_FILE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        let catalog = crate::theme::catalog();
+        let opts = RenderOptions::default(); // stack -> produces blame_keys
+        let rendered = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 80);
+        assert!(!rendered.blame_keys.is_empty(), "stack render yields blame keys");
+
+        // Attribute every new-side line of every file to "Grace".
+        let blines: Vec<crate::blame::BlameLine> = (0..200)
+            .map(|_| crate::blame::BlameLine {
+                author: "Grace".to_string(),
+                time: 0,
+            })
+            .collect();
+        let mut blame_cache: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
+        for f in 0..model.files.len() {
+            blame_cache.insert(f, blines.clone());
+        }
+        let summaries = file_summaries(&model);
+        let view = ReviewFrame {
+            lines: &rendered.lines,
+            summaries: &summaries,
+            opts: &opts,
+            theme: &theme,
+            file_count: model.files.len(),
+            selected_file: 0,
+            offset: 0,
+            h_offset: 0,
+            total: rendered.lines.len() as u16,
+            wrap: false,
+            sidebar_visible: false, // full width to the diff + blame column
+            show_help: false,
+            show_theme_selector: false,
+            catalog: &catalog,
+            theme_cursor: 0,
+            search_matches: &[],
+            search_current: None,
+            search_status: None,
+            selection: None,
+            copy_notice: None,
+            blame_on: true,
+            blame_cache: &blame_cache,
+            blame_keys: &rendered.blame_keys,
+            blame_now: 0,
+        };
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_review(f, &view);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("Grace"),
+            "the blame author should render in the gutter column"
+        );
     }
 
     #[test]
@@ -1674,6 +1860,18 @@ index 5555555..6666666 100644
     }
 
     #[test]
+    fn format_blame_cell_fits_width_padding_and_truncation() {
+        // Fits: author left-aligned, age after a space, padded to width.
+        assert_eq!(format_blame_cell("Ada", "3d", 10), "Ada     3d");
+        // Long author truncated to leave room for " " + age.
+        assert_eq!(format_blame_cell("Alexandria", "3d", 10), "Alexand 3d");
+        // Tight width clamps the whole cell to `width`.
+        assert_eq!(format_blame_cell("Bob", "10mo", 5), "B 10m");
+        // Output is always exactly `width` columns.
+        assert_eq!(format_blame_cell("x", "1y", 12).chars().count(), 12);
+    }
+
+    #[test]
     fn wheel_scroll_maps_scroll_events_and_ignores_others() {
         use ratatui::crossterm::event::MouseEventKind;
         // Down advances by step, clamped at max; Up backs off toward 0.
@@ -1743,6 +1941,8 @@ index 5555555..6666666 100644
             main_width,
         );
         let summaries = file_summaries(&model);
+        let blame_empty: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
+        let blame_keys_empty: HashMap<usize, (usize, usize)> = HashMap::new();
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
@@ -1764,6 +1964,10 @@ index 5555555..6666666 100644
             search_status: None,
             selection: None,
             copy_notice: None,
+            blame_on: false,
+            blame_cache: &blame_empty,
+            blame_keys: &blame_keys_empty,
+            blame_now: 0,
         };
 
         let backend = TestBackend::new(130, 20);
