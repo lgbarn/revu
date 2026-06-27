@@ -1869,6 +1869,41 @@ index 1111111..2222222 100644
     }
 
     #[test]
+    fn transparent_theme_drops_the_add_remove_row_tint() {
+        let model = parse_unified_diff(SAMPLE); // contains add and remove lines
+        let highlighter = Highlighter::new();
+        let opts = RenderOptions::default();
+        let base = Theme::default();
+
+        // Control: the normal theme paints the add row tint somewhere.
+        let normal = render_diff(&model, &highlighter, &base, &opts, &HashSet::new(), 50);
+        let has_tint = |r: &RenderedDiff, bg: Color| {
+            r.lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.style.bg == Some(bg)))
+        };
+        assert!(
+            has_tint(&normal, base.add_bg),
+            "control: normal theme should paint the add_bg tint"
+        );
+
+        // Transparent: neither the add nor remove row tint is painted.
+        let transparent = base.clone().into_transparent();
+        let tr = render_diff(
+            &model,
+            &highlighter,
+            &transparent,
+            &opts,
+            &HashSet::new(),
+            50,
+        );
+        assert!(
+            !has_tint(&tr, base.add_bg) && !has_tint(&tr, base.remove_bg),
+            "transparent mode must not paint the add/remove row tints"
+        );
+    }
+
+    #[test]
     fn generated_file_collapses_in_split_layout_too() {
         let model = parse_unified_diff(GENERATED_SAMPLE);
         let highlighter = Highlighter::new();

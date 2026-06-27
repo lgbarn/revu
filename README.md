@@ -157,6 +157,7 @@ mode = "auto"           # "auto", "split", "stack"
 line_numbers = true
 wrap_lines = false
 hunk_headers = true
+transparent_background = false   # true: use the terminal's background, not the theme's
 
 [custom_theme]          # optional: override a base theme
 base = "dracula"
@@ -172,10 +173,11 @@ Themes: `github-light`, `github-dark`, `catppuccin-mocha`, `dracula`, `nord`,
 `tokyo-night`, `gruvbox-dark`, `gruvbox-light`, `solarized-dark`,
 `solarized-light`, `monokai`, `one-dark`.
 
-Two further keys are accepted for hunk-config compatibility but are **not yet
-applied**: `transparent_background` (bool) is reserved for using the terminal's
-background instead of the theme's, and `vcs` (string) names a preferred VCS
-backend (only `git` is supported today). Setting them has no effect yet.
+`transparent_background = true` drops the add/remove row tints so the terminal's
+own background shows through (the `+`/`-` foreground colors and the change-bar
+still mark changes). The `vcs` (string) key is accepted for hunk-config
+compatibility but **not yet applied** — only `git` is supported today, so setting
+it has no effect yet.
 
 ## Status
 

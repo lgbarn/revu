@@ -85,6 +85,21 @@ impl Default for Theme {
     }
 }
 
+impl Theme {
+    /// Neutralize the add/remove row backgrounds (the only theme-painted diff
+    /// backgrounds) to `Color::Reset` so the terminal's own background shows
+    /// through — the `transparent_background` config. The `+`/`-` foreground
+    /// colors and the vivid change-indicator bar still mark changes, and the
+    /// status bar keeps its chrome.
+    pub fn into_transparent(mut self) -> Self {
+        self.add_bg = Color::Reset;
+        self.remove_bg = Color::Reset;
+        self.add_emph_bg = Color::Reset;
+        self.remove_emph_bg = Color::Reset;
+        self
+    }
+}
+
 /// `0xRRGGBB` -> a ratatui truecolor.
 fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -534,6 +549,21 @@ mod tests {
             theme: theme.to_string(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn into_transparent_neutralizes_row_backgrounds_only() {
+        let base = Theme::default();
+        let t = base.clone().into_transparent();
+        // The add/remove row + emphasis backgrounds become the terminal default.
+        assert_eq!(t.add_bg, Color::Reset);
+        assert_eq!(t.remove_bg, Color::Reset);
+        assert_eq!(t.add_emph_bg, Color::Reset);
+        assert_eq!(t.remove_emph_bg, Color::Reset);
+        // The foreground +/- colors (the change signal) are left intact.
+        assert_eq!(t.add, base.add);
+        assert_eq!(t.remove, base.remove);
+        assert_eq!(t.status_bg, base.status_bg);
     }
 
     #[test]

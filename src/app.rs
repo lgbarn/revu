@@ -130,6 +130,13 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
     // expensive, so it is created once here and swapped only on a live theme
     // change.
     let theme = resolve_theme(&config, theme::terminal_is_dark())?;
+    // Honor `transparent_background`: drop the add/remove row tints so the
+    // terminal's own background shows through (foreground +/- colors remain).
+    let theme = if config.transparent_background {
+        theme.into_transparent()
+    } else {
+        theme
+    };
     let highlighter = Highlighter::with_theme(&theme.syntect_theme, &theme.syntax_overrides);
     let mut opts = RenderOptions {
         line_numbers: config.line_numbers,
