@@ -48,28 +48,37 @@ pub fn run_diff(
     // `--pr <n>` reviews a GitHub PR by delegating the fetch to the user's `gh`
     // (revu itself makes no network call). It supersedes the working-tree paths.
     if let Some(number) = pr {
-        let diff_text = gh_pr_diff(number)?;
-        return review_text(&diff_text, &overrides);
+        let fetch: ReloadFn = Box::new(move || gh_pr_diff(number));
+        let diff_text = fetch()?;
+        return review_text(&diff_text, &overrides, Some(fetch));
     }
 
-    let adapter = GitAdapter::new();
-
-    let diff_text = if targets.len() == 2
+    // Build a closure that (re-)fetches the diff, so the initial load and the
+    // `r` reload share one source of truth. It captures the source parameters
+    // and re-runs git on each call.
+    let two_file = targets.len() == 2
         && std::path::Path::new(&targets[0]).exists()
-        && std::path::Path::new(&targets[1]).exists()
-    {
+        && std::path::Path::new(&targets[1]).exists();
+    let fetch: ReloadFn = if two_file {
         // Two-file mode: arbitrary file comparison, no repo required.
-        adapter.diff_files(&targets[0], &targets[1])?
+        let left = targets[0].clone();
+        let right = targets[1].clone();
+        Box::new(move || GitAdapter::new().diff_files(&left, &right))
     } else {
-        // Fail fast (and cleanly) before touching the terminal if not in a repo.
-        adapter.repo_root()?;
-        adapter.diff(&DiffOptions {
+        let opts = DiffOptions {
             staged,
             paths: targets,
             include_untracked: !exclude_untracked,
-        })?
+        };
+        Box::new(move || {
+            let adapter = GitAdapter::new();
+            // Fail fast (and cleanly) if not in a repo.
+            adapter.repo_root()?;
+            adapter.diff(&opts)
+        })
     };
-    review_text(&diff_text, &overrides)
+    let diff_text = fetch()?;
+    review_text(&diff_text, &overrides, Some(fetch))
 }
 
 /// The argv (after the `gh` program name) that fetches PR `number`'s diff.
@@ -105,24 +114,30 @@ fn gh_pr_diff(number: u64) -> Result<String> {
 /// render path. `overrides` carries CLI display flags (currently always
 /// default for `show`).
 pub fn run_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> {
-    let adapter = GitAdapter::new();
-    // Fail fast (and cleanly) before touching the terminal if not in a repo.
-    adapter.repo_root()?;
     let reff = reff.unwrap_or_else(|| "HEAD".to_string());
-    let text = adapter.revision_show(&reff)?;
-    review_text(&text, &overrides)
+    let fetch: ReloadFn = Box::new(move || {
+        let adapter = GitAdapter::new();
+        // Fail fast (and cleanly) if not in a repo.
+        adapter.repo_root()?;
+        adapter.revision_show(&reff)
+    });
+    let text = fetch()?;
+    review_text(&text, &overrides, Some(fetch))
 }
 
 /// Review a stash entry. `reff` defaults to `stash@{0}` (the latest stash).
 /// Reuses the shared [`review_text`] render path. `overrides` carries CLI
 /// display flags (currently always default for `stash show`).
 pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> {
-    let adapter = GitAdapter::new();
-    // Fail fast (and cleanly) before touching the terminal if not in a repo.
-    adapter.repo_root()?;
     let reff = reff.unwrap_or_else(|| "stash@{0}".to_string());
-    let text = adapter.stash_show(&reff)?;
-    review_text(&text, &overrides)
+    let fetch: ReloadFn = Box::new(move || {
+        let adapter = GitAdapter::new();
+        // Fail fast (and cleanly) if not in a repo.
+        adapter.repo_root()?;
+        adapter.stash_show(&reff)
+    });
+    let text = fetch()?;
+    review_text(&text, &overrides, Some(fetch))
 }
 
 /// `revu difftool <left> <right> [path]`: render the diff between two file
@@ -140,20 +155,37 @@ pub fn run_difftool(
     _path: Option<String>,
     overrides: ConfigOverrides,
 ) -> Result<()> {
-    let text = GitAdapter::new().diff_files(&left, &right)?;
-    review_text(&text, &overrides)
+    let fetch: ReloadFn = Box::new(move || GitAdapter::new().diff_files(&left, &right));
+    let text = fetch()?;
+    review_text(&text, &overrides, Some(fetch))
 }
 
-/// Parse unified diff text and review it interactively. Shared by `diff`,
-/// `pager`, and `patch` so there is a single render-loop path. `overrides`
-/// are the CLI display flags (empty for `pager`/`patch`).
-pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
+/// Re-fetches the diff text from its original source on demand (the `r` reload
+/// key). `None` for sources that cannot be re-fetched, like piped stdin.
+pub type ReloadFn = Box<dyn Fn() -> Result<String>>;
+
+/// Parse unified diff text into the renderable model: the ANSI-aware parse plus
+/// intra-line word emphasis. Shared by the initial load and every reload so they
+/// build the model identically.
+fn build_model(diff_text: &str) -> DiffModel {
     // The colored parser is ANSI-aware (for git's `--color-moved` output) but
     // behaves identically to the plain parser on zero-ANSI input, so it safely
     // handles arbitrary pager/patch stdin too.
     let mut model = parse_unified_diff_colored(diff_text);
-    // Fill intra-line word-level emphasis on modified lines before rendering.
     compute_word_emphasis(&mut model);
+    model
+}
+
+/// Parse unified diff text and review it interactively. Shared by `diff`,
+/// `pager`, and `patch` so there is a single render-loop path. `overrides`
+/// are the CLI display flags (empty for `pager`/`patch`). `reload`, when set,
+/// re-fetches the diff for the `r` key; `None` disables reload (piped stdin).
+pub fn review_text(
+    diff_text: &str,
+    overrides: &ConfigOverrides,
+    reload: Option<ReloadFn>,
+) -> Result<()> {
+    let model = build_model(diff_text);
 
     // Resolve config first (this can fail cleanly on malformed TOML, before the
     // terminal is touched). It seeds the initial toggles; a saved state.json
@@ -205,12 +237,13 @@ pub fn review_text(diff_text: &str, overrides: &ConfigOverrides) -> Result<()> {
     let mut terminal = init_review_terminal();
     let result = run_loop(
         &mut terminal,
-        &model,
+        model,
         highlighter,
         theme,
         opts,
         wrap,
         config.mode,
+        reload,
     );
     restore_review_terminal();
     result
@@ -302,16 +335,22 @@ fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
 /// options so display toggles can RE-RENDER the lines in place (rather than
 /// re-running the whole pipeline). Persists the final toggle state to
 /// `state.json` on quit.
+// ponytail: eight distinct loop inputs (terminal, model, the four view-state
+// values, mode, reload) — all genuinely separate; bundling them into a struct
+// would be artificial indirection, so the lint is allowed here rather than
+// worked around.
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut DefaultTerminal,
-    model: &DiffModel,
+    mut model: DiffModel,
     mut highlighter: Highlighter,
     mut theme: Theme,
     mut opts: RenderOptions,
     mut wrap: bool,
     mut mode: String,
+    reload: Option<ReloadFn>,
 ) -> Result<()> {
-    let file_count = model.files.len();
+    let mut file_count = model.files.len();
     // The curated catalog the theme selector cycles through. The active theme's
     // index seeds the selector cursor (or 0 when a custom theme isn't in it).
     let catalog = theme::catalog();
@@ -335,7 +374,7 @@ fn run_loop(
     // The folds the user has expanded. Empty = every fold collapsed (the default
     // view). A render toggle (like the display toggles) re-renders when it changes.
     let mut expanded_folds: HashSet<FoldId> = HashSet::new();
-    let summaries = file_summaries(model);
+    let mut summaries = file_summaries(&model);
     let mut offset: u16 = 0;
     let mut show_help = false;
     // Sidebar starts visible. The active file is DERIVED from the scroll offset
@@ -377,7 +416,7 @@ fn run_loop(
         {
             opts.mode = eff_mode;
             let r = render_diff(
-                model,
+                &model,
                 &highlighter,
                 &theme,
                 &opts,
@@ -566,6 +605,25 @@ fn run_loop(
                     let active = file_at_offset(&file_starts, offset as usize);
                     if let Some(summary) = summaries.get(active) {
                         open_in_editor(terminal, &summary.path);
+                    }
+                }
+                // Reload: re-fetch the diff from its source and rebuild the
+                // model. A no-op when the source can't be re-fetched (piped
+                // stdin -> `reload` is None) or the fetch errors (keep the
+                // current view). Scroll resets to the top and search/folds clear,
+                // since line indices and fold ids change with the new diff.
+                KeyCode::Char('r') => {
+                    if let Some(fetch) = &reload {
+                        if let Ok(text) = fetch() {
+                            model = build_model(&text);
+                            summaries = file_summaries(&model);
+                            file_count = model.files.len();
+                            offset = 0;
+                            h_offset = 0;
+                            expanded_folds.clear();
+                            search = None;
+                            needs_render = true;
+                        }
                     }
                 }
                 // Esc clears an active search first, then closes help, then quits.
@@ -1198,6 +1256,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  t   theme selector",
         "",
         "  e   open file in $EDITOR",
+        "  r   reload the diff from its source",
         "  Ctrl-Z suspend  Ctrl-C quit",
         "",
         &theme_line,
