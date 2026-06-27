@@ -276,6 +276,8 @@ pub fn review_text(
         blame_enabled,
         source,
         diff_text.to_string(),
+        config.live,
+        config.live_interval_ms,
     );
     restore_review_terminal();
     result
@@ -327,11 +329,6 @@ fn reopen_controlling_tty() -> Result<()> {
 /// hidden when the terminal is too narrow to leave room for the main view.
 const SIDEBAR_W: u16 = 28;
 
-/// Default cadence for live auto-refresh: re-fetch the diff at most this often
-/// and rebuild only when it actually changed. A named constant now; the config
-/// slice (`live_interval_ms`) makes it user-tunable.
-const LIVE_INTERVAL: Duration = Duration::from_millis(1000);
-
 /// Clamp a scroll offset to the last scrollable row: `total` lines shown in a
 /// `view_h`-row viewport scroll to at most `total - view_h`. Keeps a preserved
 /// offset in-bounds after the diff shrinks on a live reload.
@@ -380,9 +377,9 @@ fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
 /// re-running the whole pipeline). Persists the final toggle state to
 /// `state.json` on quit.
 // ponytail: distinct loop inputs (terminal, model, the four view-state values,
-// mode, reload, blame flag, the diff source + its current text for live
-// refresh) — all genuinely separate; bundling them into a struct would be
-// artificial indirection, so the lint is allowed here rather than worked around.
+// mode, reload, blame flag, the diff source + its current text, and the live
+// enable + interval) — all genuinely separate; bundling them into a struct would
+// be artificial indirection, so the lint is allowed here rather than worked around.
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut DefaultTerminal,
@@ -396,6 +393,8 @@ fn run_loop(
     blame_enabled: bool,
     source: DiffSource,
     mut current_text: String,
+    live_default: bool,
+    live_interval_ms: u64,
 ) -> Result<()> {
     let mut file_count = model.files.len();
     // Blame gutter (`B`): off until toggled; `blame_cache` maps a file index to
@@ -469,10 +468,12 @@ fn run_loop(
 
     // Live auto-refresh: poll the reload source on an interval and rebuild only
     // when the diff text actually changed. On by default for sources whose
-    // policy says so (working-tree, staged); the `L` key toggles it for any
-    // toggleable source. The configurable interval arrives in a later slice.
+    // policy says so (working-tree, staged), unless config/`--no-live` disables
+    // it; the `L` key toggles it at runtime for any toggleable source. The
+    // cadence comes from config (`live_interval_ms`).
     let live_policy = source.live_policy();
-    let mut live_on = live_policy.default_on && reload.is_some();
+    let mut live_on = live_default && live_policy.default_on && reload.is_some();
+    let live_interval = Duration::from_millis(live_interval_ms);
     let mut last_fetch = Instant::now();
 
     loop {
@@ -572,7 +573,7 @@ fn run_loop(
         // active search is re-validated in the render block (needs_render).
         // Best-effort: a fetch error is swallowed and retried next interval, so
         // a mid-save/rebase hiccup never crashes or blanks the view.
-        if live_on && last_fetch.elapsed() >= LIVE_INTERVAL {
+        if live_on && last_fetch.elapsed() >= live_interval {
             last_fetch = Instant::now();
             if let Some(Ok(text)) = reload.as_ref().map(|fetch| fetch()) {
                 if text != current_text {
