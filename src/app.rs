@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::io::IsTerminal;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
@@ -22,6 +22,7 @@ use crate::config::{Config, ConfigOverrides};
 use crate::diff::{parse_unified_diff_colored, DiffModel};
 use crate::fold::{fold_at_cursor, FoldId};
 use crate::highlight::Highlighter;
+use crate::live::DiffSource;
 use crate::osc;
 use crate::render::{
     file_at_offset, file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions,
@@ -52,7 +53,14 @@ pub fn run_diff(
         let fetch: ReloadFn = Box::new(move || gh_pr_diff(number));
         let diff_text = fetch()?;
         // A PR's new side isn't the local working tree, so blame is disabled.
-        return review_text(&diff_text, &overrides, Some(fetch), false);
+        // Re-fetchable for `r`, but never auto-polled (it hits the network).
+        return review_text(
+            &diff_text,
+            &overrides,
+            Some(fetch),
+            false,
+            DiffSource::Fixed,
+        );
     }
 
     // Build a closure that (re-)fetches the diff, so the initial load and the
@@ -84,7 +92,16 @@ pub fn run_diff(
     // working-tree diff. Two-file and staged diffs have a different new side, so
     // blame is disabled there to avoid showing the wrong revision's authorship.
     let blame_enabled = !two_file && !staged;
-    review_text(&diff_text, &overrides, Some(fetch), blame_enabled)
+    // Working-tree and staged diffs change as you edit/stage, so they auto-poll
+    // by default; an arbitrary two-file comparison is re-fetchable but opt-in.
+    let source = if two_file {
+        DiffSource::TwoFile
+    } else if staged {
+        DiffSource::Staged
+    } else {
+        DiffSource::WorkingTree
+    };
+    review_text(&diff_text, &overrides, Some(fetch), blame_enabled, source)
 }
 
 /// The argv (after the `gh` program name) that fetches PR `number`'s diff.
@@ -129,7 +146,7 @@ pub fn run_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> 
     });
     let text = fetch()?;
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
-    review_text(&text, &overrides, Some(fetch), false)
+    review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
 }
 
 /// Review a stash entry. `reff` defaults to `stash@{0}` (the latest stash).
@@ -145,7 +162,7 @@ pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Resul
     });
     let text = fetch()?;
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
-    review_text(&text, &overrides, Some(fetch), false)
+    review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
 }
 
 /// `revu difftool <left> <right> [path]`: render the diff between two file
@@ -166,7 +183,8 @@ pub fn run_difftool(
     let fetch: ReloadFn = Box::new(move || GitAdapter::new().diff_files(&left, &right));
     let text = fetch()?;
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
-    review_text(&text, &overrides, Some(fetch), false)
+    // Re-fetchable for `r`; auto-poll is opt-in for an arbitrary file pair.
+    review_text(&text, &overrides, Some(fetch), false, DiffSource::TwoFile)
 }
 
 /// Re-fetches the diff text from its original source on demand (the `r` reload
@@ -194,6 +212,7 @@ pub fn review_text(
     overrides: &ConfigOverrides,
     reload: Option<ReloadFn>,
     blame_enabled: bool,
+    source: DiffSource,
 ) -> Result<()> {
     let model = build_model(diff_text);
 
@@ -255,6 +274,8 @@ pub fn review_text(
         config.mode,
         reload,
         blame_enabled,
+        source,
+        diff_text.to_string(),
     );
     restore_review_terminal();
     result
@@ -306,6 +327,18 @@ fn reopen_controlling_tty() -> Result<()> {
 /// hidden when the terminal is too narrow to leave room for the main view.
 const SIDEBAR_W: u16 = 28;
 
+/// Default cadence for live auto-refresh: re-fetch the diff at most this often
+/// and rebuild only when it actually changed. A named constant now; the config
+/// slice (`live_interval_ms`) makes it user-tunable.
+const LIVE_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Clamp a scroll offset to the last scrollable row: `total` lines shown in a
+/// `view_h`-row viewport scroll to at most `total - view_h`. Keeps a preserved
+/// offset in-bounds after the diff shrinks on a live reload.
+fn clamp_offset(offset: u16, total: u16, view_h: u16) -> u16 {
+    offset.min(total.saturating_sub(view_h))
+}
+
 /// Minimum main-content width (columns) at which `--mode auto` switches from the
 /// unified (stack) view to the side-by-side (split) view. Below this a split
 /// would give each side ~55 cols or fewer, which is too cramped for code; above
@@ -346,10 +379,10 @@ fn main_content_width(term_width: u16, sidebar_visible: bool) -> u16 {
 /// options so display toggles can RE-RENDER the lines in place (rather than
 /// re-running the whole pipeline). Persists the final toggle state to
 /// `state.json` on quit.
-// ponytail: nine distinct loop inputs (terminal, model, the four view-state
-// values, mode, reload, blame flag) — all genuinely separate; bundling them
-// into a struct would be artificial indirection, so the lint is allowed here
-// rather than worked around.
+// ponytail: distinct loop inputs (terminal, model, the four view-state values,
+// mode, reload, blame flag, the diff source + its current text for live
+// refresh) — all genuinely separate; bundling them into a struct would be
+// artificial indirection, so the lint is allowed here rather than worked around.
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     terminal: &mut DefaultTerminal,
@@ -361,6 +394,8 @@ fn run_loop(
     mut mode: String,
     reload: Option<ReloadFn>,
     blame_enabled: bool,
+    source: DiffSource,
+    mut current_text: String,
 ) -> Result<()> {
     let mut file_count = model.files.len();
     // Blame gutter (`B`): off until toggled; `blame_cache` maps a file index to
@@ -431,6 +466,13 @@ fn run_loop(
     let mut dragged = false;
     let mut selection: Option<(usize, usize)> = None;
     let mut copy_notice: Option<String> = None;
+
+    // Live auto-refresh: poll the reload source on an interval and rebuild only
+    // when the diff text actually changed. On by default for sources whose
+    // policy says so (working-tree, staged) and that have a re-fetchable source.
+    // The runtime toggle and configurable interval arrive in later slices.
+    let live_on = source.live_policy().default_on && reload.is_some();
+    let mut last_fetch = Instant::now();
 
     loop {
         // Resolve the effective layout from the configured mode + live width so a
@@ -516,8 +558,35 @@ fn run_loop(
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
 
         let max_offset = total.saturating_sub(view_h);
-        offset = offset.min(max_offset);
+        offset = clamp_offset(offset, total, view_h);
         let page = view_h.saturating_sub(2).max(1);
+
+        // Live auto-refresh, gated on its interval so we never spawn git more
+        // than once per interval. Compare-before-rebuild: only rebuild when the
+        // text actually changed, so an idle diff costs one cheap `git diff` and
+        // no flicker. View-state (offset, h_offset, folds, search) is preserved
+        // across the rebuild; the offset is re-clamped above each frame, and an
+        // active search is re-validated in the render block (needs_render).
+        // Best-effort: a fetch error is swallowed and retried next interval, so
+        // a mid-save/rebase hiccup never crashes or blanks the view.
+        if live_on && last_fetch.elapsed() >= LIVE_INTERVAL {
+            last_fetch = Instant::now();
+            if let Some(Ok(text)) = reload.as_ref().map(|fetch| fetch()) {
+                if text != current_text {
+                    current_text = text;
+                    model = build_model(&current_text);
+                    summaries = file_summaries(&model);
+                    file_count = model.files.len();
+                    // Content changed, so a live blame gutter is now stale.
+                    // ponytail: refetches ALL files' blame on any change; scope
+                    // to only the changed files if it lags on big diffs.
+                    if blame_on {
+                        blame_cache = fetch_all_blame(&summaries);
+                    }
+                    needs_render = true;
+                }
+            }
+        }
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -707,6 +776,10 @@ fn run_loop(
                     if let Some(fetch) = &reload {
                         if let Ok(text) = fetch() {
                             model = build_model(&text);
+                            // Track the reloaded text so the next live-poll's
+                            // compare-before-rebuild sees it unchanged and skips
+                            // a redundant fetch+rebuild right after `r`.
+                            current_text = text;
                             summaries = file_summaries(&model);
                             file_count = model.files.len();
                             offset = 0;
@@ -1903,6 +1976,17 @@ index 5555555..6666666 100644
         assert_eq!(wheel_scroll(MouseEventKind::ScrollUp, 2, 3, 10), Some(0));
         // A non-scroll mouse event (e.g. a move) is not handled here.
         assert_eq!(wheel_scroll(MouseEventKind::Moved, 5, 3, 10), None);
+    }
+
+    #[test]
+    fn clamp_offset_keeps_scroll_in_bounds_after_shrink() {
+        // Within bounds: a scrollable diff keeps the offset untouched.
+        assert_eq!(clamp_offset(40, 100, 20), 40);
+        // The diff shrinks on a live reload (100 -> 30 lines): an offset past
+        // the new last scrollable row (30 - 20 = 10) is pulled back in-bounds.
+        assert_eq!(clamp_offset(40, 30, 20), 10);
+        // Diff shorter than the viewport -> no scrolling, offset pinned to 0.
+        assert_eq!(clamp_offset(5, 8, 20), 0);
     }
 
     #[test]
