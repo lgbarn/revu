@@ -21,6 +21,7 @@ use crate::highlight::Highlighter;
 use crate::render::{
     file_at_offset, file_summaries, render_diff, FileSummary, LayoutMode, RenderOptions,
 };
+use crate::search::{Match, Search};
 use crate::state::ViewState;
 use crate::theme::{self, resolve_theme, Theme};
 use crate::vcs::git::GitAdapter;
@@ -250,6 +251,8 @@ fn run_loop(
     // always renders, and thereafter only when the effective layout mode, the
     // split column width, or a display toggle changes.
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Plain text of each rendered line, rebuilt alongside `lines`, for search.
+    let mut line_texts: Vec<String> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::new();
     // Row -> FoldId for the fold bars in the current render, ascending by row.
     // Rebuilt every render alongside `lines`; the `o`/Enter toggle reads it.
@@ -270,6 +273,11 @@ fn run_loop(
     let mut cur_mode: Option<LayoutMode> = None;
     let mut cur_width: u16 = 0;
     let mut needs_render = true;
+    // Active search over the rendered lines (matches + cursor), or `None`. While
+    // `search_input` is `Some`, the user is live-typing a query in the prompt;
+    // each keystroke recomputes `search` so highlights and the counter update.
+    let mut search: Option<Search> = None;
+    let mut search_input: Option<String> = None;
 
     loop {
         // Resolve the effective layout from the configured mode + live width so a
@@ -294,11 +302,18 @@ fn run_loop(
                 main_width,
             );
             lines = r.lines;
+            line_texts = lines.iter().map(line_plain_text).collect();
             file_starts = r.file_starts;
             fold_bars = r.fold_bars;
             cur_mode = Some(eff_mode);
             cur_width = main_width;
             needs_render = false;
+            // A re-render can shift line indices (folds, toggled gutters), so
+            // recompute an active search against the new text to keep matches
+            // valid. Cursor resets to the first match — acceptable on a toggle.
+            if let Some(s) = &search {
+                search = Some(Search::new(s.query.clone(), &line_texts));
+            }
         }
 
         // Clamp rather than `as u16` so a diff over 65535 lines saturates
@@ -307,6 +322,13 @@ fn run_loop(
         // Derive the active file from the current scroll offset so the sidebar
         // highlight and the "file X/Y" status follow scrolling for free.
         let active_file = file_at_offset(&file_starts, offset as usize);
+        // Status line for the search prompt / counter, shown in place of the
+        // normal status bar while typing a query or with a search active.
+        let search_status = search_status_text(search_input.as_deref(), search.as_ref());
+        let (search_matches, search_current): (&[Match], Option<Match>) = match &search {
+            Some(s) => (&s.matches, s.current_match()),
+            None => (&[], None),
+        };
         let view = ReviewFrame {
             lines: &lines,
             summaries: &summaries,
@@ -322,6 +344,9 @@ fn run_loop(
             show_theme_selector,
             catalog: &catalog,
             theme_cursor,
+            search_matches,
+            search_current,
+            search_status,
         };
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
@@ -363,6 +388,49 @@ fn run_loop(
                 }
                 continue;
             }
+            // While typing a search query the prompt captures every key so they
+            // don't scroll the diff. Each edit live-recomputes the matches and
+            // jumps to the first; Enter confirms (keeping the search for n/N),
+            // Esc cancels and clears it.
+            if search_input.is_some() {
+                let mut recompute = false;
+                match key.code {
+                    KeyCode::Esc => {
+                        search_input = None;
+                        search = None;
+                    }
+                    KeyCode::Enter => {
+                        search_input = None;
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(b) = search_input.as_mut() {
+                            b.pop();
+                        }
+                        recompute = true;
+                    }
+                    // Ctrl-C and Ctrl-Z keep working from the prompt rather than
+                    // being typed into the query (the prompt must not trap them).
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    #[cfg(unix)]
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        suspend_and_resume(terminal);
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(b) = search_input.as_mut() {
+                            b.push(c);
+                        }
+                        recompute = true;
+                    }
+                    _ => {}
+                }
+                if recompute {
+                    let q = search_input.clone().unwrap_or_default();
+                    let s = Search::new(q, &line_texts);
+                    jump_to_match(&s, &mut offset, max_offset);
+                    search = Some(s);
+                }
+                continue;
+            }
             // Scroll + file navigation are pure offset math, extracted into
             // `scroll_offset` so they can be unit-tested. Handle them first;
             // every other key falls through to the match below.
@@ -392,21 +460,41 @@ fn run_loop(
                         open_in_editor(terminal, &summary.path);
                     }
                 }
-                // Esc closes help if open, otherwise quits.
+                // Esc clears an active search first, then closes help, then quits.
                 KeyCode::Esc => {
-                    if show_help {
+                    if search.is_some() {
+                        search = None;
+                    } else if show_help {
                         show_help = false;
                     } else {
                         break;
                     }
                 }
                 KeyCode::Char('?') => show_help = !show_help,
+                // Open the incremental-search prompt (cleared of any prior search).
+                KeyCode::Char('/') => {
+                    search_input = Some(String::new());
+                    search = None;
+                }
+                // `n`/`N` step matches while a search is active; otherwise `n`
+                // keeps its normal job of toggling the line-number gutter.
+                KeyCode::Char('N') => {
+                    if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
+                        s.prev();
+                        jump_to_match(s, &mut offset, max_offset);
+                    }
+                }
                 // Display toggles: flip the option and re-render the lines.
                 // hunk-header / context toggles change line counts, so the
                 // per-file offsets are refreshed alongside the lines.
                 KeyCode::Char('n') => {
-                    opts.line_numbers = !opts.line_numbers;
-                    needs_render = true;
+                    if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
+                        s.next();
+                        jump_to_match(s, &mut offset, max_offset);
+                    } else {
+                        opts.line_numbers = !opts.line_numbers;
+                        needs_render = true;
+                    }
                 }
                 KeyCode::Char('w') => wrap = !wrap,
                 KeyCode::Char('H') => {
@@ -558,6 +646,12 @@ struct ReviewFrame<'a> {
     catalog: &'a [Theme],
     /// The selector's highlighted row.
     theme_cursor: usize,
+    /// Search matches to highlight in the main view (empty = no active search).
+    search_matches: &'a [Match],
+    /// The current match (emphasized differently from the rest), if any.
+    search_current: Option<Match>,
+    /// Prompt/counter text shown in place of the status bar while searching.
+    search_status: Option<String>,
 }
 
 /// Paint one frame: optional sidebar + scrolled main view + status bar (+ help
@@ -582,8 +676,25 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     };
 
     // ponytail: clone per frame is wasteful for huge diffs; revisit if it ever
-    // shows up in a profile. Fine for interactive review sizes.
-    let mut paragraph = Paragraph::new(v.lines.to_vec()).scroll((v.offset, 0));
+    // shows up in a profile. Fine for interactive review sizes. When a search is
+    // active, overlay the match highlight on the (few) matched lines only.
+    let display_lines: Vec<Line<'static>> = if v.search_matches.is_empty() {
+        v.lines.to_vec()
+    } else {
+        let matched_rows: HashSet<usize> = v.search_matches.iter().map(|m| m.line).collect();
+        v.lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if matched_rows.contains(&i) {
+                    highlight_line(l, i, v.search_matches, v.search_current)
+                } else {
+                    l.clone()
+                }
+            })
+            .collect()
+    };
+    let mut paragraph = Paragraph::new(display_lines).scroll((v.offset, 0));
     if v.wrap {
         // `trim: false` keeps leading indentation when wrapping.
         paragraph = paragraph.wrap(Wrap { trim: false });
@@ -591,18 +702,27 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     frame.render_widget(paragraph, main);
 
     let max_off = v.total.saturating_sub(main.height);
-    frame.render_widget(
-        status_bar(
-            v.file_count,
-            v.selected_file,
-            v.offset,
-            max_off,
-            v.opts,
-            v.wrap,
-            v.theme,
-        ),
-        chunks[1],
-    );
+    if let Some(text) = &v.search_status {
+        // The search prompt/counter takes over the status line while searching.
+        frame.render_widget(
+            Paragraph::new(Line::from(text.clone()))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(
+            status_bar(
+                v.file_count,
+                v.selected_file,
+                v.offset,
+                max_off,
+                v.opts,
+                v.wrap,
+                v.theme,
+            ),
+            chunks[1],
+        );
+    }
 
     if v.show_help {
         render_help(frame, area, &v.theme.name);
@@ -656,6 +776,96 @@ fn scroll_offset(
 fn file_to_offset(file_starts: &[usize], idx: usize, max_offset: u16) -> u16 {
     let start = file_starts.get(idx).copied().unwrap_or(0);
     (start.min(u16::MAX as usize) as u16).min(max_offset)
+}
+
+/// Scroll offset that brings match `m` into view (at the viewport top), clamped.
+fn match_offset(m: Match, max_offset: u16) -> u16 {
+    (m.line.min(u16::MAX as usize) as u16).min(max_offset)
+}
+
+/// After the search cursor moves, scroll so the current match sits at the
+/// viewport top (clamped). No-op when the search matched nothing.
+fn jump_to_match(search: &Search, offset: &mut u16, max_offset: u16) {
+    if let Some(m) = search.current_match() {
+        *offset = match_offset(m, max_offset);
+    }
+}
+
+/// Flatten a rendered line to its plain text (span contents concatenated), so
+/// the search module can scan it without knowing about styling.
+fn line_plain_text(line: &Line<'static>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Build the status-line text for the search prompt / counter. `input` is the
+/// live-typed buffer (when the prompt is open); `search` carries the matches.
+/// Returns `None` when there is nothing to show (no prompt, no active search).
+fn search_status_text(input: Option<&str>, search: Option<&Search>) -> Option<String> {
+    match (input, search) {
+        // Live typing: show the buffer plus a match count.
+        (Some(buf), s) => {
+            let count = s.map(Search::len).unwrap_or(0);
+            Some(if buf.is_empty() {
+                "/".to_string()
+            } else if count == 0 {
+                format!("/{buf}  no matches")
+            } else {
+                format!("/{buf}  {count} matches")
+            })
+        }
+        // Confirmed search (prompt closed): show current/total or no-match.
+        (None, Some(s)) if !s.is_empty() => {
+            Some(format!("/{}  {}/{}", s.query, s.current_ordinal(), s.len()))
+        }
+        (None, Some(s)) => Some(format!("/{}  no matches", s.query)),
+        (None, None) => None,
+    }
+}
+
+/// Rebuild one line with the search highlight overlaid on its matched ranges:
+/// the current match is reversed, the rest underlined. Walks chars and coalesces
+/// runs of equal style back into spans. Only called for lines that have a match.
+fn highlight_line(
+    line: &Line<'static>,
+    line_idx: usize,
+    matches: &[Match],
+    current: Option<Match>,
+) -> Line<'static> {
+    // Expand to (char, style), inheriting each span's style.
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            chars.push((ch, span.style));
+        }
+    }
+    // Overlay the match emphasis on the covered char ranges.
+    for m in matches.iter().filter(|m| m.line == line_idx) {
+        let emphasis = if current == Some(*m) {
+            Modifier::REVERSED
+        } else {
+            Modifier::UNDERLINED
+        };
+        for (_, st) in chars.iter_mut().take(m.end).skip(m.start) {
+            *st = st.add_modifier(emphasis);
+        }
+    }
+    // Coalesce consecutive equal styles into spans.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (ch, st) in chars {
+        if Some(st) != cur {
+            if let Some(s) = cur {
+                spans.push(Span::styled(std::mem::take(&mut buf), s));
+            }
+            cur = Some(st);
+        }
+        buf.push(ch);
+    }
+    if let Some(s) = cur {
+        spans.push(Span::styled(buf, s));
+    }
+    Line::from(spans)
 }
 
 /// Truncate a path to `max` columns, keeping the tail (the filename is the most
@@ -797,6 +1007,7 @@ fn render_help(frame: &mut Frame, area: Rect, active_theme: &str) {
         "  Shift-Tab / [ previous file",
         "  s             toggle sidebar",
         "",
+        "  /   search   (n / N next / prev)",
         "  n   toggle line numbers",
         "  w   toggle line wrap",
         "  H   toggle hunk headers",
@@ -978,6 +1189,9 @@ index 5555555..6666666 100644
             show_theme_selector: false,
             catalog: &catalog,
             theme_cursor: 0,
+            search_matches: &[],
+            search_current: None,
+            search_status: None,
         };
 
         let backend = TestBackend::new(80, 16);
@@ -1109,6 +1323,9 @@ index 5555555..6666666 100644
             show_theme_selector: false,
             catalog: &catalog,
             theme_cursor: 0,
+            search_matches: &[],
+            search_current: None,
+            search_status: None,
         };
 
         let backend = TestBackend::new(130, 20);

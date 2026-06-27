@@ -13,6 +13,7 @@ mod fold;
 mod highlight;
 mod pager;
 mod render;
+mod search;
 mod state;
 mod theme;
 mod vcs;
