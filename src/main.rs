@@ -16,6 +16,7 @@ mod config;
 mod diff;
 mod fold;
 mod highlight;
+mod osc;
 mod pager;
 mod render;
 mod search;
