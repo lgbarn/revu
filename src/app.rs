@@ -363,6 +363,15 @@ fn run_loop(
                 }
                 continue;
             }
+            // Scroll + file navigation are pure offset math, extracted into
+            // `scroll_offset` so they can be unit-tested. Handle them first;
+            // every other key falls through to the match below.
+            if let Some(new_offset) =
+                scroll_offset(key.code, offset, page, max_offset, &file_starts)
+            {
+                offset = new_offset;
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') => break,
                 // Ctrl-C: in raw mode crossterm delivers it as a key event, not
@@ -392,12 +401,6 @@ fn run_loop(
                     }
                 }
                 KeyCode::Char('?') => show_help = !show_help,
-                KeyCode::Down | KeyCode::Char('j') => offset = (offset + 1).min(max_offset),
-                KeyCode::Up | KeyCode::Char('k') => offset = offset.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => offset = (offset + page).min(max_offset),
-                KeyCode::PageUp => offset = offset.saturating_sub(page),
-                KeyCode::Home | KeyCode::Char('g') => offset = 0,
-                KeyCode::End | KeyCode::Char('G') => offset = max_offset,
                 // Display toggles: flip the option and re-render the lines.
                 // hunk-header / context toggles change line counts, so the
                 // per-file offsets are refreshed alongside the lines.
@@ -454,21 +457,9 @@ fn run_loop(
                         .unwrap_or(theme_cursor);
                     show_theme_selector = true;
                 }
-                // Sidebar: toggle visibility and jump between files. Tab/BackTab
-                // are now shortcuts defined in terms of the scroll-derived active
-                // file: jump to the next/previous file's start offset (the active
-                // file then follows the offset like any other scroll).
+                // Sidebar visibility toggle. (Tab/BackTab and `[`/`]` file
+                // navigation are handled by `scroll_offset` above.)
                 KeyCode::Char('s') => sidebar_visible = !sidebar_visible,
-                KeyCode::Tab | KeyCode::Char(']') if !file_starts.is_empty() => {
-                    let current = file_at_offset(&file_starts, offset as usize);
-                    let target = (current + 1).min(file_starts.len() - 1);
-                    offset = file_to_offset(&file_starts, target, max_offset);
-                }
-                KeyCode::BackTab | KeyCode::Char('[') if !file_starts.is_empty() => {
-                    let current = file_at_offset(&file_starts, offset as usize);
-                    let target = current.saturating_sub(1);
-                    offset = file_to_offset(&file_starts, target, max_offset);
-                }
                 _ => {}
             }
         }
@@ -620,6 +611,45 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
         render_theme_selector(frame, area, v.catalog, v.theme_cursor, &v.theme.name);
     }
     main.height
+}
+
+/// Compute the new scroll offset for the scroll / file-navigation keys, or
+/// `None` when `key` is not one of them (the caller then handles it). Pure: all
+/// inputs are passed in, so it is unit-testable without a terminal. The
+/// expressions mirror the inline arms they replaced, so behavior is unchanged.
+fn scroll_offset(
+    key: KeyCode,
+    offset: u16,
+    page: u16,
+    max_offset: u16,
+    file_starts: &[usize],
+) -> Option<u16> {
+    let new_offset = match key {
+        KeyCode::Down | KeyCode::Char('j') => (offset + 1).min(max_offset),
+        KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+        KeyCode::PageDown | KeyCode::Char(' ') => (offset + page).min(max_offset),
+        KeyCode::PageUp => offset.saturating_sub(page),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => max_offset,
+        KeyCode::Tab | KeyCode::Char(']') => {
+            if file_starts.is_empty() {
+                return None;
+            }
+            let current = file_at_offset(file_starts, offset as usize);
+            let target = (current + 1).min(file_starts.len() - 1);
+            file_to_offset(file_starts, target, max_offset)
+        }
+        KeyCode::BackTab | KeyCode::Char('[') => {
+            if file_starts.is_empty() {
+                return None;
+            }
+            let current = file_at_offset(file_starts, offset as usize);
+            let target = current.saturating_sub(1);
+            file_to_offset(file_starts, target, max_offset)
+        }
+        _ => return None,
+    };
+    Some(new_offset)
 }
 
 /// Map a selected file index to a clamped scroll offset for the main view.
@@ -984,6 +1014,50 @@ index 5555555..6666666 100644
         assert_eq!(main_content_width(160, false), 160);
         // Too narrow for the sidebar: it is dropped, so full width.
         assert_eq!(main_content_width(30, true), 30);
+    }
+
+    #[test]
+    fn scroll_offset_line_and_page_movement() {
+        let fs: &[usize] = &[];
+        // Down/j increments and clamps at max_offset (at max, stays).
+        assert_eq!(scroll_offset(KeyCode::Char('j'), 0, 10, 5, fs), Some(1));
+        assert_eq!(scroll_offset(KeyCode::Down, 5, 10, 5, fs), Some(5));
+        // Up/k saturates at 0.
+        assert_eq!(scroll_offset(KeyCode::Char('k'), 0, 10, 5, fs), Some(0));
+        // Page down/up by `page`, clamped.
+        assert_eq!(scroll_offset(KeyCode::Char(' '), 0, 4, 100, fs), Some(4));
+        assert_eq!(scroll_offset(KeyCode::PageUp, 3, 10, 100, fs), Some(0));
+        // Home/g -> 0, End/G -> max_offset.
+        assert_eq!(scroll_offset(KeyCode::Char('g'), 50, 10, 80, fs), Some(0));
+        assert_eq!(scroll_offset(KeyCode::Char('G'), 0, 10, 80, fs), Some(80));
+        // A non-scroll key returns None so the caller handles it.
+        assert_eq!(scroll_offset(KeyCode::Char('q'), 0, 10, 80, fs), None);
+    }
+
+    #[test]
+    fn scroll_offset_file_navigation() {
+        // Three files starting at rows 0, 10, 25.
+        let fs: &[usize] = &[0, 10, 25];
+        // Tab from the first file jumps to the second file's start.
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, fs), Some(10));
+        // Tab past the last file clamps to the last file's start.
+        assert_eq!(scroll_offset(KeyCode::Char(']'), 25, 10, 100, fs), Some(25));
+        // BackTab from the second file goes to the first.
+        assert_eq!(scroll_offset(KeyCode::BackTab, 10, 10, 100, fs), Some(0));
+        // file_to_offset clamps the target to max_offset.
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 5, fs), Some(5));
+        // With no files, Tab/BackTab are not handled here (return None).
+        assert_eq!(scroll_offset(KeyCode::Tab, 0, 10, 100, &[]), None);
+    }
+
+    #[test]
+    fn file_to_offset_clamps_index_and_max() {
+        let fs = [0usize, 10, 25];
+        assert_eq!(file_to_offset(&fs, 1, 100), 10);
+        // Out-of-range index falls back to 0.
+        assert_eq!(file_to_offset(&fs, 9, 100), 0);
+        // Start beyond max_offset is clamped down.
+        assert_eq!(file_to_offset(&fs, 2, 20), 20);
     }
 
     #[test]
