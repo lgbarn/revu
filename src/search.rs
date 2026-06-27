@@ -22,56 +22,34 @@ pub fn find_matches(lines: &[String], query: &str) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
     }
-    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    // ASCII case-fold both sides: `to_ascii_lowercase` never changes the char
+    // count, so `start`/`end` stay valid char offsets into the rendered line.
+    // ponytail: ASCII-only case-insensitivity — fine for diffs (overwhelmingly
+    // ASCII identifiers); upgrade to Unicode folding only if a real diff needs
+    // it (and only with offset realignment, since folding can change length).
+    let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
     for (line_idx, text) in lines.iter().enumerate() {
-        // Work in chars so `start`/`end` are char offsets, and lowercase both
-        // sides for a case-insensitive compare.
-        let hay: Vec<char> = text.chars().collect();
-        let hay_lower: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
-        // Lowercasing can change length (rare: e.g. some ligatures), which would
-        // desync char offsets. Fall back to the unfolded chars in that case so
-        // offsets stay valid; the common ASCII/most-Unicode path keeps lengths.
-        if hay_lower.len() != hay.len() {
-            find_in_line(&hay, &lower_simple(query), line_idx, &mut out, true);
+        let hay: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if needle.len() > hay.len() {
             continue;
         }
-        find_in_line(&hay_lower, &needle, line_idx, &mut out, false);
-    }
-    out
-}
-
-/// Push every occurrence of `needle` in `hay` (both already lowercased unless
-/// `simple`) onto `out`, advancing past each match so they do not overlap.
-fn find_in_line(hay: &[char], needle: &[char], line: usize, out: &mut Vec<Match>, simple: bool) {
-    let hay_cmp: Vec<char> = if simple {
-        hay.iter().map(|c| c.to_ascii_lowercase()).collect()
-    } else {
-        hay.to_vec()
-    };
-    if needle.is_empty() || needle.len() > hay_cmp.len() {
-        return;
-    }
-    let mut i = 0;
-    while i + needle.len() <= hay_cmp.len() {
-        if hay_cmp[i..i + needle.len()] == needle[..] {
-            out.push(Match {
-                line,
-                start: i,
-                end: i + needle.len(),
-            });
-            i += needle.len();
-        } else {
-            i += 1;
+        // Non-overlapping scan: advance past a match so "foofoo" yields two.
+        let mut i = 0;
+        while i + needle.len() <= hay.len() {
+            if hay[i..i + needle.len()] == needle[..] {
+                out.push(Match {
+                    line: line_idx,
+                    start: i,
+                    end: i + needle.len(),
+                });
+                i += needle.len();
+            } else {
+                i += 1;
+            }
         }
     }
-}
-
-/// ponytail: ASCII-only lowercasing fallback for the rare length-changing
-/// Unicode fold. Keeps char offsets aligned; upgrade to a grapheme-aware search
-/// only if a real diff ever needs it.
-fn lower_simple(query: &str) -> Vec<char> {
-    query.chars().map(|c| c.to_ascii_lowercase()).collect()
+    out
 }
 
 /// A search and its wrapping cursor over the matches. `current` indexes into
