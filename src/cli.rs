@@ -50,7 +50,7 @@ pub enum Command {
         /// Color theme name (e.g. `auto`, `dracula`, `github-dark`)
         #[arg(long)]
         theme: Option<String>,
-        /// Layout mode (parsed/carried; applied in a later milestone)
+        /// Layout mode: `auto` (width-responsive), `split`, or `stack`/`unified`
         #[arg(long)]
         mode: Option<String>,
 
