@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::config::{Config, ConfigOverrides};
-use crate::diff::{parse_unified_diff_colored, DiffModel};
+use crate::diff::{parse_unified_diff_colored, DiffModel, FileDiff};
 use crate::fold::{fold_at_cursor, FoldId};
 use crate::highlight::Highlighter;
 use crate::live::DiffSource;
@@ -209,6 +209,19 @@ fn build_model(diff_text: &str) -> DiffModel {
 /// gates the live blame refetch — blame is refreshed only inside the `Some`
 /// (changed) branch, so an unchanged diff never re-runs `git blame`. Pulled out
 /// of `run_loop` so this rule is unit-testable in isolation.
+/// Cycle the layout mode for the `m` key: `auto -> split -> stack -> vertical
+/// -> auto`. `unified` is an alias for `stack`; any unrecognized value resets to
+/// `auto`. Pure, so the cycle order is unit-testable.
+fn next_layout_mode(mode: &str) -> String {
+    match mode {
+        "auto" => "split",
+        "split" => "stack",
+        "stack" | "unified" => "vertical",
+        _ => "auto",
+    }
+    .to_string()
+}
+
 fn apply_live_fetch(current_text: &str, fetched: &str) -> Option<DiffModel> {
     if fetched == current_text {
         None
@@ -596,15 +609,17 @@ fn run_loop(
                 // `git blame`, no flicker).
                 if let Some(new_model) = apply_live_fetch(&current_text, &text) {
                     current_text = text;
+                    // Content changed, so a live blame gutter is now stale.
+                    // Re-blame only the files whose diff actually changed; files
+                    // unchanged since the last fetch keep their cached blame
+                    // (their working-tree file is unchanged), so the per-file
+                    // `git blame` cost scopes to the edit, not the whole diff.
+                    if blame_on {
+                        blame_cache = refresh_blame_scoped(&model, &new_model, &blame_cache);
+                    }
                     model = new_model;
                     summaries = file_summaries(&model);
                     file_count = model.files.len();
-                    // Content changed, so a live blame gutter is now stale.
-                    // ponytail: refetches ALL files' blame on any change; scope
-                    // to only the changed files if it lags on big diffs.
-                    if blame_on {
-                        blame_cache = fetch_all_blame(&summaries);
-                    }
                     needs_render = true;
                 }
             }
@@ -892,12 +907,7 @@ fn run_loop(
                 // The next loop iteration re-resolves the effective mode and
                 // re-renders.
                 KeyCode::Char('m') => {
-                    mode = match mode.as_str() {
-                        "auto" => "split".to_string(),
-                        "split" => "stack".to_string(),
-                        "stack" | "unified" => "vertical".to_string(),
-                        _ => "auto".to_string(),
-                    };
+                    mode = next_layout_mode(&mode);
                     needs_render = true;
                 }
                 // Open the theme selector, seeding the cursor at the active theme.
@@ -1098,16 +1108,18 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     let mut display_lines: Vec<Line<'static>> = if v.search_matches.is_empty() {
         v.lines.to_vec()
     } else {
-        let matched_rows: HashSet<usize> = v.search_matches.iter().map(|m| m.line).collect();
+        // Group matches by line once (O(matches)) so each highlighted line does
+        // an O(1) lookup instead of re-scanning the whole match set per line.
+        let mut by_line: HashMap<usize, Vec<Match>> = HashMap::new();
+        for m in v.search_matches {
+            by_line.entry(m.line).or_default().push(*m);
+        }
         v.lines
             .iter()
             .enumerate()
-            .map(|(i, l)| {
-                if matched_rows.contains(&i) {
-                    highlight_line(l, i, v.search_matches, v.search_current)
-                } else {
-                    l.clone()
-                }
+            .map(|(i, l)| match by_line.get(&i) {
+                Some(ms) => highlight_line(l, ms, v.search_current),
+                None => l.clone(),
             })
             .collect()
     };
@@ -1287,6 +1299,65 @@ fn fetch_all_blame(summaries: &[FileSummary]) -> HashMap<usize, Vec<crate::blame
     cache
 }
 
+/// Refresh the blame cache after a live rebuild, re-running `git blame` only for
+/// files whose diff content changed. A file present in both the old and new
+/// model with identical content keeps its cached blame (its working-tree file is
+/// unchanged, so the blame is identical); only changed or newly-appeared files
+/// are re-blamed. Indices are remapped to the new model, so blame stays correct
+/// when files are added/removed between fetches.
+fn refresh_blame_scoped(
+    old_model: &DiffModel,
+    new_model: &DiffModel,
+    old_cache: &HashMap<usize, Vec<crate::blame::BlameLine>>,
+) -> HashMap<usize, Vec<crate::blame::BlameLine>> {
+    let (mut cache, to_fetch) = plan_blame_reuse(old_model, new_model, old_cache);
+    let adapter = GitAdapter::new();
+    for idx in to_fetch {
+        if let Ok(porcelain) = adapter.blame(None, &new_model.files[idx].path) {
+            cache.insert(idx, crate::blame::parse_blame(&porcelain));
+        }
+    }
+    cache
+}
+
+/// Pure planning step behind [`refresh_blame_scoped`]: decide which new-model
+/// file indices can REUSE blame carried over from the old cache, and which must
+/// be RE-FETCHED. A new file reuses old blame only when a file with the same
+/// path existed before, its content is byte-identical (path + hunks unchanged,
+/// so its working-tree blame is too), AND that old file had blame cached.
+///
+/// Returns `(reused, to_fetch)`: `reused` maps each reusing new-model index to
+/// its carried-over blame (indices remapped to the new model); `to_fetch` lists
+/// the new-model indices needing a fresh `git blame`. Split from the git call so
+/// the index-remap logic is testable without a repository.
+fn plan_blame_reuse(
+    old_model: &DiffModel,
+    new_model: &DiffModel,
+    old_cache: &HashMap<usize, Vec<crate::blame::BlameLine>>,
+) -> (HashMap<usize, Vec<crate::blame::BlameLine>>, Vec<usize>) {
+    let old_by_path: HashMap<&str, (usize, &FileDiff)> = old_model
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.path.as_str(), (i, f)))
+        .collect();
+    let mut reused = HashMap::new();
+    let mut to_fetch = Vec::new();
+    for (idx, f) in new_model.files.iter().enumerate() {
+        let carried = match old_by_path.get(f.path.as_str()) {
+            Some(&(old_idx, old_file)) if old_file == f => old_cache.get(&old_idx),
+            _ => None,
+        };
+        match carried {
+            Some(blame) => {
+                reused.insert(idx, blame.clone());
+            }
+            None => to_fetch.push(idx),
+        }
+    }
+    (reused, to_fetch)
+}
+
 /// One `width`-column blame cell for rendered row `row`: `author age`, dim, or
 /// blanks when the row has no new-side line / no blame for that file. Pure given
 /// the frame's blame data, so the column logic is unit-testable.
@@ -1390,8 +1461,7 @@ fn search_status_text(input: Option<&str>, search: Option<&Search>) -> Option<St
 /// runs of equal style back into spans. Only called for lines that have a match.
 fn highlight_line(
     line: &Line<'static>,
-    line_idx: usize,
-    matches: &[Match],
+    line_matches: &[Match],
     current: Option<Match>,
 ) -> Line<'static> {
     // Expand to (char, style), inheriting each span's style.
@@ -1401,8 +1471,9 @@ fn highlight_line(
             chars.push((ch, span.style));
         }
     }
-    // Overlay the match emphasis on the covered char ranges.
-    for m in matches.iter().filter(|m| m.line == line_idx) {
+    // Overlay the match emphasis on the covered char ranges. Callers pass only
+    // the matches that fall on this line, so no per-line filtering is needed.
+    for m in line_matches {
         let emphasis = if current == Some(*m) {
             Modifier::REVERSED
         } else {
@@ -2065,6 +2136,61 @@ index 5555555..6666666 100644
         // Going from empty to non-empty (and back) both count as changes.
         assert!(apply_live_fetch("", diff).is_some());
         assert!(apply_live_fetch("", "").is_none());
+    }
+
+    #[test]
+    fn plan_blame_reuse_reuses_unchanged_refetches_changed_and_remaps_indices() {
+        use crate::blame::BlameLine;
+        let bx = vec![BlameLine {
+            author: "ax".into(),
+            time: 1,
+        }];
+        let by = vec![BlameLine {
+            author: "ay".into(),
+            time: 2,
+        }];
+        let xy = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n\
+                  diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-c\n+d\n";
+        let old = build_model(xy);
+        let cache: HashMap<usize, Vec<BlameLine>> =
+            HashMap::from([(0, bx.clone()), (1, by.clone())]);
+
+        // Identical model: both files reused, nothing to fetch.
+        let (reused, to_fetch) = plan_blame_reuse(&old, &old, &cache);
+        assert!(to_fetch.is_empty());
+        assert_eq!(reused.get(&0), Some(&bx));
+        assert_eq!(reused.get(&1), Some(&by));
+
+        // y's content changed: only y (index 1) is refetched; x is reused.
+        let xy2 = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n\
+                   diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-c\n+CHANGED\n";
+        let (reused, to_fetch) = plan_blame_reuse(&old, &build_model(xy2), &cache);
+        assert_eq!(to_fetch, vec![1]);
+        assert_eq!(reused.get(&0), Some(&bx));
+        assert!(!reused.contains_key(&1));
+
+        // Files reordered to (y, x): carried blame is remapped to the new indices.
+        let yx = "diff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-c\n+d\n\
+                  diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        let (reused, to_fetch) = plan_blame_reuse(&old, &build_model(yx), &cache);
+        assert!(to_fetch.is_empty());
+        assert_eq!(reused.get(&0), Some(&by)); // new index 0 is now y
+        assert_eq!(reused.get(&1), Some(&bx)); // new index 1 is now x
+
+        // No prior cache entry -> every file must be fetched.
+        let (reused, to_fetch) = plan_blame_reuse(&old, &old, &HashMap::new());
+        assert!(reused.is_empty());
+        assert_eq!(to_fetch, vec![0, 1]);
+    }
+
+    #[test]
+    fn next_layout_mode_cycles_auto_split_stack_vertical() {
+        assert_eq!(next_layout_mode("auto"), "split");
+        assert_eq!(next_layout_mode("split"), "stack");
+        assert_eq!(next_layout_mode("stack"), "vertical");
+        assert_eq!(next_layout_mode("unified"), "vertical"); // alias for stack
+        assert_eq!(next_layout_mode("vertical"), "auto");
+        assert_eq!(next_layout_mode("bogus"), "auto");
     }
 
     #[test]

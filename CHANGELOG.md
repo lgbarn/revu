@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-28
+
+### Added
+
+- `revu show` and `revu stash show` now render the commit/stash metadata header
+  (hash, author, date, message) above the diff, instead of dropping it.
+
+### Fixed
+
+- Diff paths containing spaces or special characters (git's quoted `"a/..."`
+  form, including non-ASCII octal escapes) now render correctly in the sidebar
+  and header instead of being truncated to the last whitespace-delimited token.
+
+### Changed
+
+- The live blame gutter now re-runs `git blame` only for files whose content
+  changed on a live refresh, rather than re-blaming every file in the diff.
+- Faster search-match highlighting on large diffs (matches are grouped by line
+  once per render instead of re-scanned per highlighted line).
+
+### Contributor tooling
+
+- `just coverage` recipe (optional, needs `cargo-llvm-cov`), a manual-verification
+  checklist for the unix-only terminal paths in `CONTRIBUTING.md`, and added unit
+  tests for diff-path parsing, the commit-metadata header, scoped blame reuse, and
+  the layout-cycle.
+
 ## [0.1.5] - 2026-06-26
 
 ### Added

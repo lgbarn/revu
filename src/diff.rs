@@ -44,6 +44,11 @@ pub struct FileDiff {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffModel {
     pub files: Vec<FileDiff>,
+    /// Leading lines before the first `diff --git` — the commit hash, author,
+    /// date, and message that `git show` prints ahead of its diff. Empty for a
+    /// plain working-tree diff (which starts at `diff --git`). SGR already
+    /// stripped; rendered as a header above the diff.
+    pub preamble: Vec<String>,
 }
 
 /// Parse unified diff text (as produced by `git diff`) into a [`DiffModel`].
@@ -81,6 +86,8 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut cur_file: Option<FileDiff> = None;
     let mut cur_hunk: Option<Hunk> = None;
+    // Metadata lines preceding the first file (the `git show` commit header).
+    let mut preamble: Vec<String> = Vec::new();
 
     for (line, moved) in lines {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -103,6 +110,17 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
                 header: line.clone(),
                 lines: Vec::new(),
             });
+        } else if cur_hunk.is_none() && (line.starts_with("--- ") || line.starts_with("+++ ")) {
+            // File-header path lines (before the first `@@`). Unlike the
+            // `diff --git a/x b/x` line, each carries a SINGLE path, so it is
+            // unambiguous even when the path contains spaces. Prefer it as the
+            // authoritative path; `+++` (new side) wins over `---` (old side),
+            // and `/dev/null` (add/delete) is skipped. The `cur_hunk.is_none()`
+            // guard keeps a real removed line like `--- text` inside a hunk from
+            // being mistaken for a header.
+            if let (Some(f), Some(path)) = (cur_file.as_mut(), parse_header_path(&line[4..])) {
+                f.path = path;
+            }
         } else if let Some(hunk) = cur_hunk.as_mut() {
             // Inside a hunk, classify by the first character. The `---`/`+++`
             // file headers never reach here because they appear before the
@@ -121,6 +139,10 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
                 emphasis: Vec::new(),
                 moved,
             });
+        } else if files.is_empty() && cur_file.is_none() {
+            // Before the first file: leading metadata (the `git show` commit
+            // header). Anything here is preamble, not diff content.
+            preamble.push(line);
         }
     }
 
@@ -128,7 +150,11 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
     if let Some(f) = cur_file.take() {
         files.push(f);
     }
-    DiffModel { files }
+    // Drop the blank line(s) git puts between the message and the first diff.
+    while preamble.last().is_some_and(|l| l.trim().is_empty()) {
+        preamble.pop();
+    }
+    DiffModel { files, preamble }
 }
 
 /// Strip ANSI SGR (`ESC [ ... m`) escape sequences from `line`, returning the
@@ -197,13 +223,97 @@ fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>) {
 }
 
 /// Extract the new-side path from the remainder of a `diff --git a/x b/x` line.
-/// ponytail: assumes paths without spaces (the common case); quoted/space paths
-/// are a later refinement (git emits `diff --git "a/p" "b/p"` with quoting).
+/// This line is ambiguous for paths with spaces (no delimiter between the two
+/// sides), so it is only an initial guess: [`build_model`] overrides it with the
+/// unambiguous single-path `--- a/x` / `+++ b/x` header lines whenever they are
+/// present (every file with content changes has them). Handles git's C-quoting
+/// for the quoted form `diff --git "a/p" "b/p"`.
 fn parse_diff_git_path(rest: &str) -> String {
+    if let Some(inner) = rest.strip_prefix('"') {
+        // Quoted form: the new side is the second quoted token. Find the close
+        // of the first quote (respecting `\"`), then parse the second quote.
+        if let Some(second) = rest[1..].find("\"b/").map(|i| &rest[1 + i..]) {
+            if let Some(path) = parse_header_path(second) {
+                return path;
+            }
+        }
+        // Single quoted token fallback (e.g. malformed/rename): decode it.
+        let inner = inner.strip_suffix('"').unwrap_or(inner);
+        return strip_ab_prefix(&unquote_c_path(inner));
+    }
     match rest.split(' ').next_back() {
-        Some(b) => b.strip_prefix("b/").unwrap_or(b).to_string(),
+        Some(b) => strip_ab_prefix(b),
         None => rest.to_string(),
     }
+}
+
+/// Extract a clean file path from a `--- ` / `+++ ` header remainder (the text
+/// after the 4-char prefix). Handles git's C-quoting (paths with spaces, quotes,
+/// or non-ASCII bytes) and strips the `a/`/`b/` prefix. Returns `None` for
+/// `/dev/null` (the add/delete side, which carries no real path).
+fn parse_header_path(rest: &str) -> Option<String> {
+    // git diff emits no trailing timestamp, but `diff -u` appends `\t<time>`;
+    // drop it defensively. A literal tab cannot appear unquoted in a real path.
+    let rest = rest.split('\t').next().unwrap_or(rest);
+    let path = if let Some(inner) = rest.strip_prefix('"') {
+        unquote_c_path(inner.strip_suffix('"').unwrap_or(inner))
+    } else {
+        rest.to_string()
+    };
+    if path == "/dev/null" {
+        return None;
+    }
+    Some(strip_ab_prefix(&path))
+}
+
+/// Strip the leading `a/` or `b/` that git prepends to diff paths.
+fn strip_ab_prefix(p: &str) -> String {
+    p.strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// Decode a git C-quoted path body (the text inside the surrounding quotes).
+/// git escapes `"`, `\`, the control chars (`\a \b \t \n \v \f \r`), and — when
+/// `core.quotepath` is on — high-bit bytes as `\ooo` octal. Bytes are rebuilt
+/// and lossily re-UTF-8'd, so multi-byte chars emitted as octal round-trip.
+fn unquote_c_path(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume the backslash
+        let Some(&c) = bytes.get(i) else { break };
+        match c {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'v' => out.push(0x0b),
+            b'f' => out.push(0x0c),
+            b'r' => out.push(b'\r'),
+            b'0'..=b'7' => {
+                // Up to three octal digits encode one byte.
+                let mut val = (c - b'0') as u32;
+                let mut k = 1;
+                while k < 3 && matches!(bytes.get(i + 1), Some(b'0'..=b'7')) {
+                    i += 1;
+                    val = val * 8 + (bytes[i] - b'0') as u32;
+                    k += 1;
+                }
+                out.push(val as u8);
+            }
+            other => out.push(other), // `\"`, `\\`, and any literal escape
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -271,6 +381,77 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(model.files[0].path, "img.png");
         assert!(model.files[0].binary);
         assert!(model.files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn spaced_and_quoted_paths_resolved_from_header_lines() {
+        // git leaves spaces unquoted on the `diff --git` line (ambiguous), but
+        // the single-path `+++` header is unambiguous, so the path is exact.
+        let spaced = "\
+diff --git a/dir/my file.txt b/dir/my file.txt
+--- a/dir/my file.txt
++++ b/dir/my file.txt
+@@ -1 +1 @@
+-a
++b
+";
+        assert_eq!(parse_unified_diff(spaced).files[0].path, "dir/my file.txt");
+
+        // C-quoted header (special char) is decoded, including octal bytes.
+        let quoted = "\
+diff --git \"a/caf\\303\\251 \\\"x\\\".txt\" \"b/caf\\303\\251 \\\"x\\\".txt\"
+--- \"a/caf\\303\\251 \\\"x\\\".txt\"
++++ \"b/caf\\303\\251 \\\"x\\\".txt\"
+@@ -1 +1 @@
+-a
++b
+";
+        assert_eq!(parse_unified_diff(quoted).files[0].path, "café \"x\".txt");
+
+        // Deleted side: `+++ /dev/null` must fall back to the `---` path.
+        let deleted = "\
+diff --git a/gone file b/gone file
+--- a/gone file
++++ /dev/null
+@@ -1 +0,0 @@
+-a
+";
+        assert_eq!(parse_unified_diff(deleted).files[0].path, "gone file");
+    }
+
+    #[test]
+    fn git_show_commit_metadata_captured_as_preamble() {
+        // `git show` prints the commit header before the diff; revu keeps it as
+        // the model preamble (trailing blank lines trimmed) and still parses the
+        // diff. A plain working-tree diff has no preamble.
+        let show = "\
+commit 8eb5964fe0952bfbff6556739249b2fa73f45bd0
+Author: A B <a@b.com>
+Date:   Sat Jun 27 15:33:42 2026 -0400
+
+    chore: release v0.2.0
+
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1 +1 @@
+-a
++b
+";
+        let model = parse_unified_diff(show);
+        assert_eq!(model.files.len(), 1);
+        assert_eq!(model.files[0].path, "x");
+        assert_eq!(
+            model.preamble.first().unwrap(),
+            &show.lines().next().unwrap()
+        );
+        assert!(model.preamble.iter().any(|l| l.contains("chore: release")));
+        // No dangling blank line between message and diff.
+        assert!(!model.preamble.last().unwrap().trim().is_empty());
+
+        // Plain diff: nothing before `diff --git`, so no preamble.
+        let plain = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(parse_unified_diff(plain).preamble.is_empty());
     }
 
     #[test]

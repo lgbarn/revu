@@ -42,3 +42,14 @@ audit:
     set -euo pipefail
     if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; else echo "skip: cargo-deny not installed"; fi
     if command -v cargo-audit >/dev/null 2>&1; then cargo audit; else echo "skip: cargo-audit not installed"; fi
+
+# Line-coverage summary (informational; no threshold enforced, not a CI gate).
+# Needs cargo-llvm-cov (install: cargo install cargo-llvm-cov); skipped when absent.
+coverage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-llvm-cov >/dev/null 2>&1; then
+        cargo llvm-cov --all-targets --summary-only
+    else
+        echo "skip: cargo-llvm-cov not installed (cargo install cargo-llvm-cov)"
+    fi

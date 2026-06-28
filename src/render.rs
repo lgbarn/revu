@@ -175,23 +175,69 @@ fn layout_rows(
     folds: &HashSet<FoldId>,
     width: u16,
 ) -> RenderedDiff {
-    if model.files.is_empty() {
-        return RenderedDiff {
+    let mut rendered = if model.files.is_empty() {
+        RenderedDiff {
             lines: vec![Line::from("No changes in the working tree.")],
             file_starts: Vec::new(),
             hunk_starts: Vec::new(),
             fold_bars: Vec::new(),
             blame_keys: HashMap::new(),
-        };
+        }
+    } else {
+        match opts.mode {
+            LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, folds, width),
+            // ponytail: split renders every CONTEXT line uncollapsed (no per-hunk
+            // folds); folding its paired change-groups is a later add. It does honor
+            // whole-file generated-file collapse, so noise files fold in both layouts.
+            LayoutMode::Split => split_rows(model, highlighter, theme, opts, folds, width),
+            LayoutMode::Vertical => vertical_rows(model, highlighter, theme, opts, folds, width),
+        }
+    };
+    // The `git show` commit header (hash/author/date/message) renders above the
+    // diff; prepending here covers all three layouts in one place.
+    if !model.preamble.is_empty() {
+        prepend_commit_header(&mut rendered, &model.preamble, theme);
     }
-    match opts.mode {
-        LayoutMode::Stack => stack_rows(model, highlighter, theme, opts, folds, width),
-        // ponytail: split renders every CONTEXT line uncollapsed (no per-hunk
-        // folds); folding its paired change-groups is a later add. It does honor
-        // whole-file generated-file collapse, so noise files fold in both layouts.
-        LayoutMode::Split => split_rows(model, highlighter, theme, opts, folds, width),
-        LayoutMode::Vertical => vertical_rows(model, highlighter, theme, opts, folds, width),
+    rendered
+}
+
+/// Prepend the commit/stash metadata header (the model preamble) above the
+/// rendered diff and shift every row index — file starts, hunk starts, fold
+/// bars, and blame keys — down by the header height so `{`/`}`/`Tab` navigation
+/// and the blame gutter stay aligned with the rows they point at.
+fn prepend_commit_header(rendered: &mut RenderedDiff, preamble: &[String], theme: &Theme) {
+    let mut header: Vec<Line<'static>> = preamble
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            // The first line ("commit <hash>") gets the file-header accent; the
+            // author/date/message lines are dimmed with the gutter color.
+            let color = if i == 0 {
+                theme.file_header
+            } else {
+                theme.gutter
+            };
+            Line::styled(raw.clone(), Style::default().fg(color))
+        })
+        .collect();
+    let shift = header.len();
+    header.append(&mut rendered.lines);
+    rendered.lines = header;
+    for s in rendered
+        .file_starts
+        .iter_mut()
+        .chain(&mut rendered.hunk_starts)
+    {
+        *s += shift;
     }
+    for (row, _) in &mut rendered.fold_bars {
+        *row += shift;
+    }
+    rendered.blame_keys = rendered
+        .blame_keys
+        .iter()
+        .map(|(&row, &v)| (row + shift, v))
+        .collect();
 }
 
 /// Width (in digit columns) of each numeric gutter column for the whole model:
@@ -1416,6 +1462,31 @@ index 3333333..4444444 100644
         assert!(first.contains("a.txt"), "first header was {first:?}");
         let second = rendered.lines[rendered.file_starts[1]].to_string();
         assert!(second.contains("b.txt"), "second header was {second:?}");
+    }
+
+    #[test]
+    fn commit_header_renders_above_diff_and_shifts_starts() {
+        let mut model = parse_unified_diff(TWO_FILE);
+        model.preamble = vec![
+            "commit deadbeef".to_string(),
+            "Author: A B <a@b.com>".to_string(),
+        ];
+        let highlighter = Highlighter::new();
+        let rendered = render_diff(
+            &model,
+            &highlighter,
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
+        // Header is the first two rows; the first file now starts below it.
+        assert!(rendered.lines[0].to_string().contains("commit deadbeef"));
+        assert!(rendered.lines[1].to_string().contains("Author:"));
+        assert_eq!(rendered.file_starts[0], 2);
+        assert!(rendered.lines[rendered.file_starts[0]]
+            .to_string()
+            .contains("a.txt"));
     }
 
     #[test]
