@@ -33,7 +33,8 @@ startup. revu gives you the same day-to-day reviewing experience with:
 ## Features
 
 - **Review anything**: the working tree, staged changes, a commit, a stash, a
-  patch file, or two arbitrary files.
+  patch file, or two arbitrary files. `show` and `stash show` display the commit
+  metadata header (hash, author, date, message) above the diff.
 - **Drop-in git pager**: set `revu pager` as git's `core.pager` and every
   `git diff` / `git show` opens in revu; non-diff output falls back to your
   plain-text pager.
