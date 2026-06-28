@@ -190,7 +190,7 @@ pub fn catalog() -> Vec<Theme> {
             0x1e5230,
             0x5c2a2c,
             0x8b949e,
-            0x484f58,
+            0x59616c,
             0x58a6ff,
             0xbc8cff,
             0x1f6feb,
@@ -210,7 +210,7 @@ pub fn catalog() -> Vec<Theme> {
             0x315c42,
             0x5e3140,
             0xa6adc8,
-            0x585b70,
+            0x656981,
             0x89dceb,
             0xf5c2e7,
             0x45475a,
@@ -229,8 +229,8 @@ pub fn catalog() -> Vec<Theme> {
             0x3a2128,
             0x2a5c3e,
             0x5e2f33,
-            0x6272a4,
-            0x44475a,
+            0x8491b8,
+            0x6d7290,
             0x8be9fd,
             0xff79c6,
             0x44475a,
@@ -242,7 +242,7 @@ pub fn catalog() -> Vec<Theme> {
             true,
             "base16-ocean.dark",
             0x88c0d0,
-            0xb48ead,
+            0xb691af,
             0xa3be8c,
             0xbf616a,
             0x20342a,
@@ -250,7 +250,7 @@ pub fn catalog() -> Vec<Theme> {
             0x35543f,
             0x573439,
             0xd8dee9,
-            0x4c566a,
+            0x707e98,
             0x8fbcbb,
             0xb48ead,
             0x434c5e,
@@ -270,7 +270,7 @@ pub fn catalog() -> Vec<Theme> {
             0x305839,
             0x5c2f3c,
             0xa9b1d6,
-            0x414868,
+            0x5b6591,
             0x7dcfff,
             0xbb9af7,
             0x283457,
@@ -290,7 +290,7 @@ pub fn catalog() -> Vec<Theme> {
             0x4a5226,
             0x5e2f26,
             0xa89984,
-            0x504945,
+            0x7a6f69,
             0x83a598,
             0xd3869b,
             0x3c3836,
@@ -301,7 +301,7 @@ pub fn catalog() -> Vec<Theme> {
             "gruvbox-light",
             false,
             "base16-ocean.light",
-            0xb57614,
+            0x976211,
             0x8f3f71,
             0x79740e,
             0x9d0006,
@@ -309,20 +309,20 @@ pub fn catalog() -> Vec<Theme> {
             0xf6ddc9,
             0xc7d49a,
             0xf0b6a8,
-            0x7c6f64,
-            0xbdae93,
+            0x786b61,
+            0x9d8860,
             0x076678,
             0x8f3f71,
             0xebdbb2,
             0xfbf1c7,
-            0xb57614,
+            0x976211,
         ),
         mk(
             "solarized-dark",
             true,
             "Solarized (dark)",
-            0x268bd2,
-            0x6c71c4,
+            0x3094da,
+            0x8388cd,
             0x859900,
             0xdc322f,
             0x123a2c,
@@ -330,32 +330,32 @@ pub fn catalog() -> Vec<Theme> {
             0x32502a,
             0x5e2c2e,
             0x93a1a1,
-            0x586e75,
+            0x5c747b,
             0x2aa198,
             0xd33682,
             0x073642,
-            0x002b36,
+            0x00222a,
             0x268bd2,
         ),
         mk(
             "solarized-light",
             false,
             "Solarized (light)",
-            0x268bd2,
-            0x6c71c4,
-            0x859900,
+            0x2076b3,
+            0x6368c0,
+            0x7b8d00,
             0xdc322f,
             0xe6ecc8,
             0xf6ddcc,
             0xc9d79a,
             0xf2b8ac,
-            0x657b83,
-            0x93a1a1,
-            0x2aa198,
+            0x60747c,
+            0x819191,
+            0x26948b,
             0xd33682,
             0xeee8d5,
             0xfdf6e3,
-            0x268bd2,
+            0x2076b3,
         ),
         mk(
             "monokai",
@@ -369,8 +369,8 @@ pub fn catalog() -> Vec<Theme> {
             0x3a1f2a,
             0x44552a,
             0x5e2a40,
-            0x75715e,
-            0x49483e,
+            0x938f79,
+            0x737162,
             0x66d9ef,
             0xae81ff,
             0x3e3d32,
@@ -390,7 +390,7 @@ pub fn catalog() -> Vec<Theme> {
             0x365840,
             0x5a3038,
             0xabb2bf,
-            0x5c6370,
+            0x6d7585,
             0x56b6c2,
             0xc678dd,
             0x3e4451,
@@ -613,6 +613,95 @@ mod tests {
                 "theme {:?} remove emphasis tint equals its row tint",
                 t.name
             );
+        }
+    }
+
+    #[test]
+    fn catalog_themes_meet_wcag_aa_contrast() {
+        // Contrast policy: real text (headers, context, status bar) holds WCAG
+        // AA 4.5:1; UI graphics (the dim line-number gutter and the `+`/`-` diff
+        // glyphs, whose legibility is backed by the row tint + change-bar) hold
+        // the 3:1 graphics threshold. This guards the palette against a future
+        // edit silently reintroducing an unreadable color. Note: syntax-highlight
+        // foregrounds come from the bundled syntect themes, not this palette, so
+        // they are out of scope here.
+        const TEXT_AA: f64 = 4.5;
+        const UI_AA: f64 = 3.0;
+
+        // revu draws on the terminal's own background, so the catalog has no
+        // base-bg field; these are the canonical editor backgrounds each theme
+        // is designed for, used only to check chrome contrast.
+        fn base_bg(name: &str) -> u32 {
+            match name {
+                "github-light" => 0xffffff,
+                "github-dark" => 0x0d1117,
+                "catppuccin-mocha" => 0x1e1e2e,
+                "dracula" => 0x282a36,
+                "nord" => 0x2e3440,
+                "tokyo-night" => 0x1a1b26,
+                "gruvbox-dark" => 0x282828,
+                "gruvbox-light" => 0xfbf1c7,
+                "solarized-dark" => 0x002b36,
+                "solarized-light" => 0xfdf6e3,
+                "monokai" => 0x272822,
+                "one-dark" => 0x282c34,
+                other => panic!("no base background known for theme {other:?}"),
+            }
+        }
+        fn comps(c: Color) -> (f64, f64, f64) {
+            match c {
+                Color::Rgb(r, g, b) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
+                other => panic!("catalog colors must be Rgb, got {other:?}"),
+            }
+        }
+        fn luminance(c: Color) -> f64 {
+            let (r, g, b) = comps(c);
+            let lin = |x: f64| {
+                if x <= 0.03928 {
+                    x / 12.92
+                } else {
+                    ((x + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        }
+        fn contrast(a: Color, b: Color) -> f64 {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+
+        for t in catalog() {
+            let base = rgb(base_bg(&t.name));
+            for (label, fg) in [
+                ("file_header", t.file_header),
+                ("hunk_header", t.hunk_header),
+                ("context", t.context),
+            ] {
+                let c = contrast(fg, base);
+                assert!(
+                    c >= TEXT_AA,
+                    "{} {label} on base: {c:.2} < {TEXT_AA}",
+                    t.name
+                );
+            }
+            let s = contrast(t.status_fg, t.status_bg);
+            assert!(s >= TEXT_AA, "{} status bar: {s:.2} < {TEXT_AA}", t.name);
+
+            let g = contrast(t.gutter, base);
+            assert!(g >= UI_AA, "{} gutter on base: {g:.2} < {UI_AA}", t.name);
+            for (label, fg, bg) in [
+                ("add", t.add, t.add_bg),
+                ("remove", t.remove, t.remove_bg),
+                ("moved_add", t.moved_add, t.add_bg),
+                ("moved_remove", t.moved_remove, t.remove_bg),
+            ] {
+                let c = contrast(fg, bg);
+                assert!(
+                    c >= UI_AA,
+                    "{} {label} on row tint: {c:.2} < {UI_AA}",
+                    t.name
+                );
+            }
         }
     }
 

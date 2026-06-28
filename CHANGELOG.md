@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-28
+
+### Fixed
+
+- All 12 built-in themes now meet WCAG AA contrast: real text (file/hunk
+  headers, context, status bar) at 4.5:1 and UI graphics (the line-number gutter
+  and `+`/`-` diff glyphs) at 3:1. Colors were nudged in lightness only, keeping
+  each theme's hue. A unit test guards the catalog against regressions. (Syntax
+  highlight colors come from the bundled syntect themes and are out of scope.)
+
 ## [0.3.0] - 2026-06-28
 
 ### Added
