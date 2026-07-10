@@ -1,10 +1,10 @@
 //! `revu pager` and `revu patch` — entrypoints that consume stdin or a file.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::app;
 use crate::config::ConfigOverrides;
@@ -17,6 +17,23 @@ pub enum PatchSource {
     File(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagerAction {
+    PassThrough,
+    ReviewDiff,
+    PageText,
+}
+
+fn pager_action(stdout_is_terminal: bool, input_is_diff: bool) -> PagerAction {
+    if !stdout_is_terminal {
+        PagerAction::PassThrough
+    } else if input_is_diff {
+        PagerAction::ReviewDiff
+    } else {
+        PagerAction::PageText
+    }
+}
+
 /// `revu pager`: render a diff piped on stdin (git's `core.pager`). If the
 /// input is not a diff, hand it to a plain-text pager so non-diff `git`
 /// output still paginates.
@@ -27,13 +44,27 @@ pub fn run_pager(overrides: ConfigOverrides) -> Result<()> {
         .context("failed to read stdin")?;
     let text = String::from_utf8_lossy(&bytes);
 
-    if looks_like_diff(&text) {
-        // Display flags from the CLI apply to the diff view; config + state.json
-        // still layer underneath. Non-diff input goes to a plain pager below.
-        // No reload: the diff arrived on stdin and cannot be re-fetched.
-        app::review_text(&text, &overrides, None, false, DiffSource::Stdin)
-    } else {
-        spawn_text_pager(&bytes)
+    match pager_action(std::io::stdout().is_terminal(), looks_like_diff(&text)) {
+        PagerAction::PassThrough => {
+            std::io::stdout()
+                .write_all(&bytes)
+                .context("failed to pass pager input to stdout")?;
+            Ok(())
+        }
+        PagerAction::ReviewDiff => {
+            // Display flags from the CLI apply to the diff view; config + state.json
+            // still layer underneath. Non-diff input goes to a plain pager below.
+            // No reload: the diff arrived on stdin and cannot be re-fetched.
+            app::review_text(
+                &text,
+                &overrides,
+                None,
+                false,
+                DiffSource::Stdin,
+                app::ReviewContext::default(),
+            )
+        }
+        PagerAction::PageText => spawn_text_pager(&bytes),
     }
 }
 
@@ -46,7 +77,14 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
             std::io::stdin()
                 .read_to_string(&mut s)
                 .context("failed to read patch from stdin")?;
-            app::review_text(&s, &overrides, None, false, DiffSource::Stdin)
+            app::review_text(
+                &s,
+                &overrides,
+                None,
+                false,
+                DiffSource::Stdin,
+                app::ReviewContext::default(),
+            )
         }
         PatchSource::File(path) => {
             // A patch file CAN be re-read, so `r` reloads it from disk.
@@ -56,7 +94,14 @@ pub fn run_patch(file: Option<String>, overrides: ConfigOverrides) -> Result<()>
             });
             let text = fetch()?;
             // A patch file is re-fetchable for `r` but not auto-polled.
-            app::review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
+            app::review_text(
+                &text,
+                &overrides,
+                Some(fetch),
+                false,
+                DiffSource::Fixed,
+                app::ReviewContext::default(),
+            )
         }
     }
 }
@@ -115,7 +160,10 @@ fn spawn_text_pager(bytes: &[u8]) -> Result<()> {
         // Ignore a broken pipe if the pager exits before consuming everything.
         let _ = child_stdin.write_all(bytes);
     }
-    child.wait().context("pager process failed")?;
+    let status = child.wait().context("pager process failed")?;
+    if !status.success() {
+        bail!("pager `{program}` exited with {status}");
+    }
     Ok(())
 }
 
@@ -173,5 +221,13 @@ mod tests {
         let (prog, args) = pager_command(None, None);
         assert_eq!(prog, "less");
         assert_eq!(args, vec!["-R"]);
+    }
+
+    #[test]
+    fn redirected_stdout_always_passes_input_through() {
+        assert_eq!(pager_action(false, true), PagerAction::PassThrough);
+        assert_eq!(pager_action(false, false), PagerAction::PassThrough);
+        assert_eq!(pager_action(true, true), PagerAction::ReviewDiff);
+        assert_eq!(pager_action(true, false), PagerAction::PageText);
     }
 }

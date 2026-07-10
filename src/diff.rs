@@ -23,6 +23,10 @@ pub struct DiffLine {
     /// of a moved block (vs a genuine add/remove). Set only by
     /// [`parse_unified_diff_colored`]; always `false` from the plain parser.
     pub moved: bool,
+    /// The source line was immediately followed by the unified-diff
+    /// `\\ No newline at end of file` marker. The marker is metadata: it does
+    /// not consume an old/new line number or participate in word pairing.
+    pub no_newline: bool,
 }
 
 /// A single `@@ ... @@` hunk and its lines.
@@ -36,8 +40,19 @@ pub struct Hunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
+    /// Native path bytes kept separate from the lossy display string.
+    pub path_bytes: Vec<u8>,
     pub binary: bool,
     pub hunks: Vec<Hunk>,
+    /// Commit metadata that precedes this file in a multi-commit patch. The
+    /// first commit stays in [`DiffModel::preamble`] for compatibility.
+    pub preamble: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedPath {
+    display: String,
+    bytes: Vec<u8>,
 }
 
 /// The parsed diff: an ordered list of changed files.
@@ -86,40 +101,105 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut cur_file: Option<FileDiff> = None;
     let mut cur_hunk: Option<Hunk> = None;
+    let mut hunk_remaining: Option<(usize, usize)> = None;
     // Metadata lines preceding the first file (the `git show` commit header).
     let mut preamble: Vec<String> = Vec::new();
+    // Metadata preceding a later file in a multi-commit patch.
+    let mut pending_preamble: Vec<String> = Vec::new();
+    // Old-side path held between a generic `---` / `+++` header pair.
+    let mut pending_old_path: Option<ParsedPath> = None;
 
     for (line, moved) in lines {
+        // The no-newline marker belongs to the preceding source line even when
+        // that line completed the hunk's declared old/new counts.
+        if line == "\\ No newline at end of file" {
+            if let Some(previous) = cur_hunk.as_mut().and_then(|h| h.lines.last_mut()) {
+                previous.no_newline = true;
+            }
+            continue;
+        }
+
+        // Count-aware hunk termination lets a header-only generic patch start
+        // its next file without mistaking `--- path` for removed content.
+        if hunk_remaining == Some((0, 0)) {
+            flush_hunk(&mut cur_file, &mut cur_hunk);
+            hunk_remaining = None;
+        }
+
         if let Some(rest) = line.strip_prefix("diff --git ") {
             flush_hunk(&mut cur_file, &mut cur_hunk);
+            hunk_remaining = None;
             if let Some(f) = cur_file.take() {
                 files.push(f);
             }
+            let path = parse_diff_git_path(rest);
             cur_file = Some(FileDiff {
-                path: parse_diff_git_path(rest),
+                path: path.display,
+                path_bytes: path.bytes,
                 binary: false,
                 hunks: Vec::new(),
+                preamble: take_trimmed(&mut pending_preamble),
             });
+            pending_old_path = None;
+        } else if cur_hunk.is_none()
+            && line.starts_with("commit ")
+            && (cur_file.is_some() || !files.is_empty())
+        {
+            if let Some(f) = cur_file.take() {
+                files.push(f);
+            }
+            pending_preamble.clear();
+            pending_preamble.push(line);
+            pending_old_path = None;
         } else if line.starts_with("Binary files ") {
             if let Some(f) = cur_file.as_mut() {
                 f.binary = true;
             }
         } else if line.starts_with("@@") {
             flush_hunk(&mut cur_file, &mut cur_hunk);
+            hunk_remaining = parse_hunk_counts(&line);
             cur_hunk = Some(Hunk {
                 header: line.clone(),
                 lines: Vec::new(),
             });
-        } else if cur_hunk.is_none() && (line.starts_with("--- ") || line.starts_with("+++ ")) {
-            // File-header path lines (before the first `@@`). Unlike the
-            // `diff --git a/x b/x` line, each carries a SINGLE path, so it is
-            // unambiguous even when the path contains spaces. Prefer it as the
-            // authoritative path; `+++` (new side) wins over `---` (old side),
-            // and `/dev/null` (add/delete) is skipped. The `cur_hunk.is_none()`
-            // guard keeps a real removed line like `--- text` inside a hunk from
-            // being mistaken for a header.
-            if let (Some(f), Some(path)) = (cur_file.as_mut(), parse_header_path(&line[4..])) {
-                f.path = path;
+        } else if cur_hunk.is_none() && line.starts_with("--- ") {
+            // A generic patch has no `diff --git` delimiter. If the current
+            // file already owns hunks, this header starts the next file.
+            if cur_file.as_ref().is_some_and(|f| !f.hunks.is_empty()) {
+                files.push(cur_file.take().expect("checked above"));
+            }
+            let git_header = cur_file.is_some();
+            pending_old_path = parse_path_token(&line[4..], git_header);
+            if let (Some(f), Some(path)) = (cur_file.as_mut(), pending_old_path.as_ref()) {
+                set_file_path(f, path.clone());
+            }
+        } else if cur_hunk.is_none() && line.starts_with("+++ ") {
+            let git_header = cur_file.is_some();
+            let new_path = parse_path_token(&line[4..], git_header);
+            if cur_file.is_none() {
+                let path = new_path.clone().or_else(|| pending_old_path.clone());
+                if let Some(path) = path {
+                    cur_file = Some(FileDiff {
+                        path: path.display,
+                        path_bytes: path.bytes,
+                        binary: false,
+                        hunks: Vec::new(),
+                        preamble: take_trimmed(&mut pending_preamble),
+                    });
+                }
+            } else if let (Some(f), Some(path)) = (cur_file.as_mut(), new_path) {
+                set_file_path(f, path);
+            }
+            pending_old_path = None;
+        } else if cur_hunk.is_none()
+            && (line.starts_with("rename to ") || line.starts_with("copy to "))
+        {
+            let rest = line
+                .strip_prefix("rename to ")
+                .or_else(|| line.strip_prefix("copy to "))
+                .expect("prefix checked");
+            if let (Some(f), Some(path)) = (cur_file.as_mut(), parse_path_token(rest, false)) {
+                set_file_path(f, path);
             }
         } else if let Some(hunk) = cur_hunk.as_mut() {
             // Inside a hunk, classify by the first character. The `---`/`+++`
@@ -138,11 +218,24 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
                 content,
                 emphasis: Vec::new(),
                 moved,
+                no_newline: false,
             });
+            if let Some((old, new)) = hunk_remaining.as_mut() {
+                match hunk.lines.last().expect("just pushed").kind {
+                    LineKind::Context => {
+                        *old = old.saturating_sub(1);
+                        *new = new.saturating_sub(1);
+                    }
+                    LineKind::Remove => *old = old.saturating_sub(1),
+                    LineKind::Add => *new = new.saturating_sub(1),
+                }
+            }
         } else if files.is_empty() && cur_file.is_none() {
             // Before the first file: leading metadata (the `git show` commit
             // header). Anything here is preamble, not diff content.
             preamble.push(line);
+        } else if cur_file.is_none() {
+            pending_preamble.push(line);
         }
     }
 
@@ -155,6 +248,29 @@ fn build_model<I: Iterator<Item = (String, bool)>>(lines: I) -> DiffModel {
         preamble.pop();
     }
     DiffModel { files, preamble }
+}
+
+fn take_trimmed(lines: &mut Vec<String>) -> Vec<String> {
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    std::mem::take(lines)
+}
+
+fn parse_hunk_counts(header: &str) -> Option<(usize, usize)> {
+    let mut parts = header.split_whitespace();
+    parts.next().filter(|part| *part == "@@")?;
+    let old = parse_range_count(parts.next()?, '-')?;
+    let new = parse_range_count(parts.next()?, '+')?;
+    Some((old, new))
+}
+
+fn parse_range_count(range: &str, prefix: char) -> Option<usize> {
+    let range = range.strip_prefix(prefix)?;
+    match range.split_once(',') {
+        Some((_, count)) => count.parse().ok(),
+        None => Some(1),
+    }
 }
 
 /// Strip ANSI SGR (`ESC [ ... m`) escape sequences from `line`, returning the
@@ -181,11 +297,10 @@ fn strip_sgr(line: &str) -> (String, Vec<u16>) {
         chars.next(); // consume '['
         let mut params = String::new();
         let mut final_byte = None;
-        // CSI parameter/intermediate bytes run until a final byte (an ASCII
-        // letter here covers `m` and the cursor-movement finals we discard).
+        // CSI parameter/intermediate bytes run until a final byte (`@`..=`~`).
         while let Some(&nc) = chars.peek() {
             chars.next();
-            if nc.is_ascii_alphabetic() {
+            if ('@'..='~').contains(&nc) {
                 final_byte = Some(nc);
                 break;
             }
@@ -197,6 +312,10 @@ fn strip_sgr(line: &str) -> (String, Vec<u16>) {
                     codes.push(n);
                 }
             }
+        } else if final_byte.is_none() {
+            // Malformed/unterminated CSI: discard ESC + `[` but preserve the
+            // printable tail rather than silently swallowing user content.
+            clean.push_str(&params);
         }
     }
     (clean, codes)
@@ -211,9 +330,18 @@ fn strip_sgr(line: &str) -> (String, Vec<u16>) {
 /// Heuristic and git-version dependent (git owns the move classification; revu
 /// only reads the resulting color). Documented + isolated here on purpose.
 fn codes_indicate_move(codes: &[u16]) -> bool {
-    codes
-        .iter()
-        .any(|&c| matches!(c, 33 | 34 | 35 | 36 | 93 | 94 | 95 | 96))
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            // Extended foreground forms: their palette index / RGB channels
+            // are data, not standalone SGR colors.
+            38 | 48 | 58 if codes.get(i + 1) == Some(&5) => i += 3,
+            38 | 48 | 58 if codes.get(i + 1) == Some(&2) => i += 5,
+            33 | 34 | 35 | 36 | 93 | 94 | 95 | 96 => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>) {
@@ -228,22 +356,22 @@ fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>) {
 /// unambiguous single-path `--- a/x` / `+++ b/x` header lines whenever they are
 /// present (every file with content changes has them). Handles git's C-quoting
 /// for the quoted form `diff --git "a/p" "b/p"`.
-fn parse_diff_git_path(rest: &str) -> String {
+fn parse_diff_git_path(rest: &str) -> ParsedPath {
     if let Some(inner) = rest.strip_prefix('"') {
         // Quoted form: the new side is the second quoted token. Find the close
         // of the first quote (respecting `\"`), then parse the second quote.
         if let Some(second) = rest[1..].find("\"b/").map(|i| &rest[1 + i..]) {
-            if let Some(path) = parse_header_path(second) {
+            if let Some(path) = parse_path_token(second, true) {
                 return path;
             }
         }
         // Single quoted token fallback (e.g. malformed/rename): decode it.
         let inner = inner.strip_suffix('"').unwrap_or(inner);
-        return strip_ab_prefix(&unquote_c_path(inner));
+        return parsed_path(strip_ab_prefix_bytes(unquote_c_path_bytes(inner)), false);
     }
     match rest.split(' ').next_back() {
-        Some(b) => strip_ab_prefix(b),
-        None => rest.to_string(),
+        Some(b) => parsed_path(b.as_bytes().to_vec(), true),
+        None => parsed_path(rest.as_bytes().to_vec(), false),
     }
 }
 
@@ -251,34 +379,50 @@ fn parse_diff_git_path(rest: &str) -> String {
 /// after the 4-char prefix). Handles git's C-quoting (paths with spaces, quotes,
 /// or non-ASCII bytes) and strips the `a/`/`b/` prefix. Returns `None` for
 /// `/dev/null` (the add/delete side, which carries no real path).
-fn parse_header_path(rest: &str) -> Option<String> {
+fn parse_path_token(rest: &str, strip_git_prefix: bool) -> Option<ParsedPath> {
     // git diff emits no trailing timestamp, but `diff -u` appends `\t<time>`;
     // drop it defensively. A literal tab cannot appear unquoted in a real path.
     let rest = rest.split('\t').next().unwrap_or(rest);
-    let path = if let Some(inner) = rest.strip_prefix('"') {
-        unquote_c_path(inner.strip_suffix('"').unwrap_or(inner))
+    let bytes = if let Some(inner) = rest.strip_prefix('"') {
+        unquote_c_path_bytes(inner.strip_suffix('"').unwrap_or(inner))
     } else {
-        rest.to_string()
+        rest.as_bytes().to_vec()
     };
-    if path == "/dev/null" {
+    if bytes == b"/dev/null" {
         return None;
     }
-    Some(strip_ab_prefix(&path))
+    Some(parsed_path(bytes, strip_git_prefix))
 }
 
-/// Strip the leading `a/` or `b/` that git prepends to diff paths.
-fn strip_ab_prefix(p: &str) -> String {
-    p.strip_prefix("a/")
-        .or_else(|| p.strip_prefix("b/"))
-        .unwrap_or(p)
-        .to_string()
+fn parsed_path(bytes: Vec<u8>, strip_git_prefix: bool) -> ParsedPath {
+    let bytes = if strip_git_prefix {
+        strip_ab_prefix_bytes(bytes)
+    } else {
+        bytes
+    };
+    ParsedPath {
+        display: String::from_utf8_lossy(&bytes).into_owned(),
+        bytes,
+    }
+}
+
+fn strip_ab_prefix_bytes(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(b"a/") || bytes.starts_with(b"b/") {
+        bytes.drain(..2);
+    }
+    bytes
+}
+
+fn set_file_path(file: &mut FileDiff, path: ParsedPath) {
+    file.path = path.display;
+    file.path_bytes = path.bytes;
 }
 
 /// Decode a git C-quoted path body (the text inside the surrounding quotes).
 /// git escapes `"`, `\`, the control chars (`\a \b \t \n \v \f \r`), and — when
 /// `core.quotepath` is on — high-bit bytes as `\ooo` octal. Bytes are rebuilt
 /// and lossily re-UTF-8'd, so multi-byte chars emitted as octal round-trip.
-fn unquote_c_path(body: &str) -> String {
+fn unquote_c_path_bytes(body: &str) -> Vec<u8> {
     let bytes = body.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -313,7 +457,7 @@ fn unquote_c_path(body: &str) -> String {
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 #[cfg(test)]
@@ -417,6 +561,10 @@ diff --git a/gone file b/gone file
 -a
 ";
         assert_eq!(parse_unified_diff(deleted).files[0].path, "gone file");
+
+        let non_utf8 = "diff --git \"a/bad\\377\" \"b/bad\\377\"\n--- \"a/bad\\377\"\n+++ \"b/bad\\377\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let file = &parse_unified_diff(non_utf8).files[0];
+        assert_eq!(file.path_bytes, b"bad\xff");
     }
 
     #[test]
@@ -455,6 +603,56 @@ diff --git a/x b/x
     }
 
     #[test]
+    fn parses_generic_unified_patch_with_timestamps() {
+        let text = "--- old/file.txt\t2026-01-01 00:00:00\n+++ new/file.txt\t2026-01-02 00:00:00\n@@ -1 +1 @@\n-old\n+new\n";
+        let model = parse_unified_diff(text);
+        assert_eq!(model.files.len(), 1);
+        assert_eq!(model.files[0].path, "new/file.txt");
+        assert_eq!(model.files[0].hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn parses_multiple_generic_patch_files() {
+        let text = "--- old-a\n+++ new-a\n@@ -1 +1 @@\n-a\n+b\n--- old-b\n+++ new-b\n@@ -1 +1 @@\n-c\n+d\n";
+        let model = parse_unified_diff(text);
+        assert_eq!(model.files.len(), 2);
+        assert_eq!(model.files[0].path, "new-a");
+        assert_eq!(model.files[1].path, "new-b");
+    }
+
+    #[test]
+    fn git_log_p_separates_commit_metadata_from_hunks() {
+        let text = "commit first\nAuthor: One\n\ndiff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n\ncommit second\nAuthor: Two\n\ndiff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-c\n+d\n";
+        let model = parse_unified_diff(text);
+        assert_eq!(model.files.len(), 2);
+        assert_eq!(model.files[0].hunks[0].lines.len(), 2);
+        assert_eq!(
+            model.files[1].preamble.first().map(String::as_str),
+            Some("commit second")
+        );
+        assert!(model.files[0].hunks[0]
+            .lines
+            .iter()
+            .all(|line| !line.content.starts_with("commit ")));
+    }
+
+    #[test]
+    fn no_newline_marker_attaches_to_preceding_line() {
+        let text = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
+        let model = parse_unified_diff(text);
+        let lines = &model.files[0].hunks[0].lines;
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].no_newline);
+        assert!(lines[1].no_newline);
+    }
+
+    #[test]
+    fn pure_rename_with_spaces_uses_rename_to_path() {
+        let text = "diff --git a/old name.txt b/new name.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new name.txt\n";
+        assert_eq!(parse_unified_diff(text).files[0].path, "new name.txt");
+    }
+
+    #[test]
     fn file_header_markers_are_not_mistaken_for_changes() {
         // The `--- a/x` / `+++ b/x` lines must not be parsed as remove/add lines.
         let text = "\
@@ -478,6 +676,13 @@ diff --git a/x b/x
         let (clean, codes) = strip_sgr("+normal");
         assert_eq!(clean, "+normal");
         assert!(codes.is_empty());
+
+        let (clean, codes) = strip_sgr("before\x1b[1~after");
+        assert_eq!(clean, "beforeafter");
+        assert!(codes.is_empty());
+
+        let (clean, _) = strip_sgr("before\x1b[31");
+        assert_eq!(clean, "before31");
     }
 
     #[test]
@@ -537,5 +742,23 @@ index 1111111..2222222 100644
         assert_eq!(lines[3].kind, LineKind::Remove);
         assert_eq!(lines[3].content, "moved out there");
         assert!(lines[3].moved, "magenta remove must be moved");
+    }
+
+    #[test]
+    fn rgb_component_does_not_mark_line_moved() {
+        let colored = concat!(
+            "diff --git a/a b/a\n",
+            "@@ -0,0 +1 @@\n",
+            "\x1b[38;2;34;200;10m+ordinary add\x1b[m\n",
+        );
+        let model = parse_unified_diff_colored(colored);
+        assert!(!model.files[0].hunks[0].lines[0].moved);
+
+        for sgr in ["48;2;34;200;10", "48;5;34", "58;2;35;20;10"] {
+            let colored =
+                format!("diff --git a/a b/a\n@@ -0,0 +1 @@\n\x1b[{sgr}m+ordinary add\x1b[m\n");
+            let model = parse_unified_diff_colored(&colored);
+            assert!(!model.files[0].hunks[0].lines[0].moved, "SGR {sgr}");
+        }
     }
 }

@@ -16,7 +16,7 @@
 class Revu < Formula
   desc "Fast, memory-safe terminal diff/review tool (a Rust port of hunk)"
   homepage "https://github.com/lgbarn/revu"
-  version "0.1.0" # TODO: bump per release to match the git tag (without the leading 'v')
+  version "0.3.1" # Must match Cargo.toml and the release tag (without leading 'v').
   license any_of: ["MIT", "Apache-2.0"]
 
   on_macos do

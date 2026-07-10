@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::vcs::git::GitAdapter;
@@ -22,6 +22,7 @@ use crate::vcs::VcsAdapter;
 /// Default live auto-refresh cadence in milliseconds (1s). The single source of
 /// truth for the `live_interval_ms` default.
 pub const DEFAULT_LIVE_INTERVAL_MS: u64 = 1000;
+pub const MIN_LIVE_INTERVAL_MS: u64 = 250;
 
 /// Fully-resolved configuration the rest of the app consumes.
 ///
@@ -160,6 +161,9 @@ pub fn resolve(
     // CLI overrides win over every file layer.
     if let Some(v) = &overrides.theme {
         cfg.theme = v.clone();
+        if let Some(custom) = cfg.custom_theme.as_mut() {
+            custom.base = None;
+        }
     }
     if let Some(v) = &overrides.mode {
         cfg.mode = v.clone();
@@ -175,6 +179,10 @@ pub fn resolve(
     }
     if let Some(v) = overrides.live {
         cfg.live = v;
+    }
+
+    if cfg.live_interval_ms < MIN_LIVE_INTERVAL_MS {
+        bail!("live_interval_ms must be at least {MIN_LIVE_INTERVAL_MS}");
     }
 
     Ok(cfg)
@@ -276,6 +284,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_live_interval_is_rejected() {
+        let err = resolve(
+            None,
+            Some("live_interval_ms = 0\n"),
+            &ConfigOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("live_interval_ms must be at least 250"));
+        assert!(resolve(
+            None,
+            Some("live_interval_ms = 249\n"),
+            &ConfigOverrides::default()
+        )
+        .is_err());
+        assert_eq!(
+            resolve(
+                None,
+                Some("live_interval_ms = 250\n"),
+                &ConfigOverrides::default()
+            )
+            .unwrap()
+            .live_interval_ms,
+            250
+        );
+    }
+
+    #[test]
     fn default_mode_is_stack() {
         // revu defaults to the unified (stack) layout; "auto"/"split" remain
         // selectable via config or `--mode`.
@@ -318,6 +355,23 @@ mod tests {
         assert!(!cfg.line_numbers);
         assert!(!cfg.hunk_headers);
         assert_eq!(cfg.theme, "solarized");
+    }
+
+    #[test]
+    fn cli_theme_suppresses_custom_base_but_keeps_overrides() {
+        let repo = "theme = \"dark\"\n[custom_theme]\nbase = \"dracula\"\nadded = \"#010203\"\n";
+        let overrides = ConfigOverrides {
+            theme: Some("nord".to_string()),
+            ..ConfigOverrides::default()
+        };
+        let cfg = resolve(None, Some(repo), &overrides).unwrap();
+        assert_eq!(cfg.theme, "nord");
+        let custom = cfg.custom_theme.expect("custom overlay preserved");
+        assert_eq!(custom.base, None);
+        assert_eq!(
+            custom.colors.get("added").map(String::as_str),
+            Some("#010203")
+        );
     }
 
     #[test]

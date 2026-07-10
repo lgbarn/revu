@@ -21,7 +21,7 @@ bin-dir = "{ bin }{ binary-ext }"
 # separate crossterm dependency). anyhow: ergonomic error propagation.
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 
 # syntect: syntax highlighting. `default-features = false` + `default-fancy`
 # selects the pure-Rust fancy-regex engine (NOT the C-linked oniguruma default)
@@ -40,6 +40,12 @@ similar = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+# tempfile: same-directory atomic replacement for state.json. This avoids torn
+# view-state files across crashes and works on Unix and Windows.
+tempfile = "3"
+# terminal-colorsaurus: bounded OSC 10/11 query for reliable automatic
+# light/dark theme selection when COLORFGBG is unavailable.
+terminal-colorsaurus = "1.0.3"
 
 # rustix (pure Rust, no libc) for two unix needs: `stdio` dup2's /dev/tty onto
 # stdin when a diff is piped in (pager mode); `process` raises SIGTSTP on our own
@@ -47,9 +53,11 @@ serde_json = "1"
 # so this only enables features on the existing copy rather than adding a crate.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "0.38", features = ["stdio", "process"] }
+# signal-hook: graceful SIGTERM/SIGHUP notification so terminal cleanup runs
+# outside the signal handler before the default signal action is restored.
+# Crossterm already brings this exact crate family into the dependency graph.
+signal-hook = "0.3"
 
 [dev-dependencies]
 # insta: snapshot testing of rendered terminal buffers.
 insta = "1"
-# tempfile: scratch git repos / files for VcsAdapter unit tests (dev only).
-tempfile = "3"

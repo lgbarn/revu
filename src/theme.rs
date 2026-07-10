@@ -15,6 +15,8 @@
 //! we deliberately do NOT vendor 12 tmThemes now.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use ratatui::style::Color;
@@ -509,6 +511,9 @@ pub fn parse_hex(s: &str) -> Result<Color> {
             body.len()
         );
     }
+    if !body.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("invalid hex color {s:?}: non-hex digit");
+    }
     let parse = |range: std::ops::Range<usize>| -> Result<u8> {
         u8::from_str_radix(&body[range], 16)
             .map_err(|_| anyhow!("invalid hex color {s:?}: non-hex digit"))
@@ -523,10 +528,20 @@ pub fn parse_hex(s: &str) -> Result<Color> {
 /// reply off the tty) is the full solution; `$COLORFGBG` is a widely-set, zero-IO
 /// proxy that covers the common case. Upgrade to OSC 11 later if needed.
 pub fn terminal_is_dark() -> bool {
-    std::env::var("COLORFGBG")
+    if let Some(dark) = std::env::var("COLORFGBG")
         .ok()
         .and_then(|v| bg_is_dark_from_colorfgbg(&v))
-        .unwrap_or(true)
+    {
+        return dark;
+    }
+    if std::io::stdout().is_terminal() {
+        let mut options = terminal_colorsaurus::QueryOptions::default();
+        options.timeout = Duration::from_millis(200);
+        if let Ok(mode) = terminal_colorsaurus::theme_mode(options) {
+            return mode == terminal_colorsaurus::ThemeMode::Dark;
+        }
+    }
+    true
 }
 
 /// Pure parser for `$COLORFGBG` ("fg;bg" or "fg;default;bg"): the background is
@@ -952,6 +967,7 @@ mod tests {
         assert!(parse_hex("#fffffff").is_err());
         // Non-hex digit.
         assert!(parse_hex("#gggggg").is_err());
+        assert!(parse_hex("#\u{20ac}\u{20ac}").is_err());
         // Empty.
         assert!(parse_hex("").is_err());
     }

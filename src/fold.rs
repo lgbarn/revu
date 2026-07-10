@@ -203,6 +203,7 @@ mod tests {
                     content: String::new(),
                     emphasis: Vec::new(),
                     moved: false,
+                    no_newline: false,
                 }
             })
             .collect()

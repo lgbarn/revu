@@ -6,7 +6,7 @@
 
 pub mod git;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -46,5 +46,5 @@ pub trait VcsAdapter {
     /// `git blame --porcelain` for `path`, optionally at revision `reff` (the
     /// new side of the diff). `None` blames the working-tree file. The caller
     /// parses the porcelain with [`crate::blame::parse_blame`].
-    fn blame(&self, reff: Option<&str>, path: &str) -> Result<String>;
+    fn blame(&self, reff: Option<&str>, path: &Path) -> Result<String>;
 }
