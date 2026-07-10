@@ -2,8 +2,12 @@
 //! and `patch` (via [`review_text`]).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -60,6 +64,10 @@ pub fn run_diff(
             Some(fetch),
             false,
             DiffSource::Fixed,
+            ReviewContext {
+                repo_root: GitAdapter::new().repo_root().ok(),
+                editor_target: None,
+            },
         );
     }
 
@@ -69,6 +77,10 @@ pub fn run_diff(
     let two_file = targets.len() == 2
         && std::path::Path::new(&targets[0]).exists()
         && std::path::Path::new(&targets[1]).exists();
+    let editor_target = two_file.then(|| PathBuf::from(&targets[1]));
+    let repo_root = (!two_file)
+        .then(|| GitAdapter::new().repo_root().ok())
+        .flatten();
     let fetch: ReloadFn = if two_file {
         // Two-file mode: arbitrary file comparison, no repo required.
         let left = targets[0].clone();
@@ -101,7 +113,17 @@ pub fn run_diff(
     } else {
         DiffSource::WorkingTree
     };
-    review_text(&diff_text, &overrides, Some(fetch), blame_enabled, source)
+    review_text(
+        &diff_text,
+        &overrides,
+        Some(fetch),
+        blame_enabled,
+        source,
+        ReviewContext {
+            repo_root,
+            editor_target,
+        },
+    )
 }
 
 /// The argv (after the `gh` program name) that fetches PR `number`'s diff.
@@ -130,7 +152,7 @@ fn gh_pr_diff(number: u64) -> Result<String> {
         }
         bail!("`gh pr diff {number}` failed: {detail}");
     }
-    String::from_utf8(output.stdout).context("`gh pr diff` produced non-UTF-8 output")
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Review a commit. `reff` defaults to `HEAD`. Reuses the shared [`review_text`]
@@ -146,7 +168,17 @@ pub fn run_show(reff: Option<String>, overrides: ConfigOverrides) -> Result<()> 
     });
     let text = fetch()?;
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
-    review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
+    review_text(
+        &text,
+        &overrides,
+        Some(fetch),
+        false,
+        DiffSource::Fixed,
+        ReviewContext {
+            repo_root: GitAdapter::new().repo_root().ok(),
+            editor_target: None,
+        },
+    )
 }
 
 /// Review a stash entry. `reff` defaults to `stash@{0}` (the latest stash).
@@ -162,7 +194,17 @@ pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Resul
     });
     let text = fetch()?;
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
-    review_text(&text, &overrides, Some(fetch), false, DiffSource::Fixed)
+    review_text(
+        &text,
+        &overrides,
+        Some(fetch),
+        false,
+        DiffSource::Fixed,
+        ReviewContext {
+            repo_root: GitAdapter::new().repo_root().ok(),
+            editor_target: None,
+        },
+    )
 }
 
 /// `revu difftool <left> <right> [path]`: render the diff between two file
@@ -177,19 +219,47 @@ pub fn run_stash_show(reff: Option<String>, overrides: ConfigOverrides) -> Resul
 pub fn run_difftool(
     left: String,
     right: String,
-    _path: Option<String>,
+    path: Option<String>,
     overrides: ConfigOverrides,
 ) -> Result<()> {
+    let right_target = PathBuf::from(&right);
     let fetch: ReloadFn = Box::new(move || GitAdapter::new().diff_files(&left, &right));
     let text = fetch()?;
+    let repo_root = GitAdapter::new().repo_root().ok();
+    let editor_target = path.map(PathBuf::from).map(|path| {
+        if path.is_absolute() {
+            path
+        } else if let Some(root) = &repo_root {
+            root.join(path)
+        } else {
+            path
+        }
+    });
     // Blame is the working-tree-diff MVP only; disabled for show/stash/difftool.
     // Re-fetchable for `r`; auto-poll is opt-in for an arbitrary file pair.
-    review_text(&text, &overrides, Some(fetch), false, DiffSource::TwoFile)
+    review_text(
+        &text,
+        &overrides,
+        Some(fetch),
+        false,
+        DiffSource::TwoFile,
+        ReviewContext {
+            repo_root,
+            editor_target: editor_target.or(Some(right_target)),
+        },
+    )
 }
 
 /// Re-fetches the diff text from its original source on demand (the `r` reload
 /// key). `None` for sources that cannot be re-fetched, like piped stdin.
 pub type ReloadFn = Box<dyn Fn() -> Result<String>>;
+
+/// Filesystem identity carried alongside display-only diff paths.
+#[derive(Debug, Default)]
+pub struct ReviewContext {
+    repo_root: Option<PathBuf>,
+    editor_target: Option<PathBuf>,
+}
 
 /// Parse unified diff text into the renderable model: the ANSI-aware parse plus
 /// intra-line word emphasis. Shared by the initial load and every reload so they
@@ -201,6 +271,15 @@ fn build_model(diff_text: &str) -> DiffModel {
     let mut model = parse_unified_diff_colored(diff_text);
     compute_word_emphasis(&mut model);
     model
+}
+
+fn apply_path_hint(model: &mut DiffModel, context: &ReviewContext) {
+    if model.files.len() == 1 {
+        if let Some(path) = &context.editor_target {
+            model.files[0].path = path.to_string_lossy().into_owned();
+            model.files[0].path_bytes = path_bytes(path);
+        }
+    }
 }
 
 /// The compare-before-rebuild decision for a live re-fetch: rebuild the model
@@ -230,6 +309,43 @@ fn apply_live_fetch(current_text: &str, fetched: &str) -> Option<DiffModel> {
     }
 }
 
+fn selected_theme(theme: Theme, transparent_background: bool) -> Theme {
+    if transparent_background {
+        theme.into_transparent()
+    } else {
+        theme
+    }
+}
+
+fn initial_live_enabled(
+    source: DiffSource,
+    configured: bool,
+    explicit_override: bool,
+    has_reload: bool,
+) -> bool {
+    let policy = source.live_policy();
+    configured && has_reload && (policy.default_on || (explicit_override && policy.toggleable))
+}
+
+fn apply_saved_view_state(
+    opts: &mut RenderOptions,
+    wrap: &mut bool,
+    state: Option<ViewState>,
+    overrides: &ConfigOverrides,
+) {
+    let Some(state) = state else { return };
+    if overrides.line_numbers.is_none() {
+        opts.line_numbers = state.line_numbers;
+    }
+    if overrides.hunk_headers.is_none() {
+        opts.hunk_headers = state.hunk_headers;
+    }
+    if overrides.wrap_lines.is_none() {
+        *wrap = state.wrap_lines;
+    }
+    opts.context_collapsed = state.context_collapsed;
+}
+
 /// Parse unified diff text and review it interactively. Shared by `diff`,
 /// `pager`, and `patch` so there is a single render-loop path. `overrides`
 /// are the CLI display flags (empty for `pager`/`patch`). `reload`, when set,
@@ -240,8 +356,10 @@ pub fn review_text(
     reload: Option<ReloadFn>,
     blame_enabled: bool,
     source: DiffSource,
+    context: ReviewContext,
 ) -> Result<()> {
-    let model = build_model(diff_text);
+    let mut model = build_model(diff_text);
+    apply_path_hint(&mut model, &context);
 
     // Resolve config first (this can fail cleanly on malformed TOML, before the
     // terminal is touched). It seeds the initial toggles; a saved state.json
@@ -257,11 +375,7 @@ pub fn review_text(
     let theme = resolve_theme(&config, theme::terminal_is_dark())?;
     // Honor `transparent_background`: drop the add/remove row tints so the
     // terminal's own background shows through (foreground +/- colors remain).
-    let theme = if config.transparent_background {
-        theme.into_transparent()
-    } else {
-        theme
-    };
+    let theme = selected_theme(theme, config.transparent_background);
     let highlighter = Highlighter::with_theme(&theme.syntect_theme, &theme.syntax_overrides);
     let mut opts = RenderOptions {
         line_numbers: config.line_numbers,
@@ -273,12 +387,7 @@ pub fn review_text(
         mode: LayoutMode::Stack,
     };
     let mut wrap = config.wrap_lines;
-    if let Some(state) = ViewState::load() {
-        opts.line_numbers = state.line_numbers;
-        opts.hunk_headers = state.hunk_headers;
-        opts.context_collapsed = state.context_collapsed;
-        wrap = state.wrap_lines;
-    }
+    apply_saved_view_state(&mut opts, &mut wrap, ViewState::load(), overrides);
 
     // When the diff arrives on a pipe (e.g. git's pager), stdin is not the
     // terminal, so crossterm has nothing to read key events from. Reopen the
@@ -288,8 +397,8 @@ pub fn review_text(
         reopen_controlling_tty()?;
     }
 
-    // `ratatui::init` installs a panic hook that restores the terminal, so a
-    // crash mid-render won't leave the user in a broken alternate screen.
+    install_mouse_cleanup_panic_hook();
+    let termination_signal = register_termination_signals()?;
     let mut terminal = init_review_terminal();
     let result = run_loop(
         &mut terminal,
@@ -302,12 +411,49 @@ pub fn review_text(
         reload,
         blame_enabled,
         source,
+        context,
         diff_text.to_string(),
         config.live,
+        overrides.live.is_some(),
         config.live_interval_ms,
+        config.transparent_background,
+        Arc::clone(&termination_signal),
     );
     restore_review_terminal();
+    #[cfg(unix)]
+    {
+        let signal = termination_signal.load(Ordering::Relaxed);
+        if signal != 0 {
+            signal_hook::low_level::emulate_default_handler(signal as i32)?;
+        }
+    }
     result
+}
+
+fn install_mouse_cleanup_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = write_mouse_disable(std::io::stdout());
+            previous(info);
+        }));
+    });
+}
+
+#[cfg(unix)]
+fn register_termination_signals() -> Result<Arc<AtomicUsize>> {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+
+    let signal = Arc::new(AtomicUsize::new(0));
+    signal_hook::flag::register_usize(SIGTERM, Arc::clone(&signal), SIGTERM as usize)?;
+    signal_hook::flag::register_usize(SIGHUP, Arc::clone(&signal), SIGHUP as usize)?;
+    Ok(signal)
+}
+
+#[cfg(not(unix))]
+fn register_termination_signals() -> Result<Arc<AtomicUsize>> {
+    Ok(Arc::new(AtomicUsize::new(0)))
 }
 
 /// Enter the review UI: ratatui's alternate screen + raw mode, plus mouse
@@ -330,8 +476,12 @@ fn init_review_terminal() -> DefaultTerminal {
 /// and cooked mode, handing the terminal back clean to the shell, `$EDITOR`, or
 /// the exiting process. Mirrors [`init_review_terminal`].
 fn restore_review_terminal() {
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = write_mouse_disable(std::io::stdout());
     ratatui::restore();
+}
+
+fn write_mouse_disable(mut writer: impl std::io::Write) -> std::io::Result<()> {
+    execute!(writer, DisableMouseCapture)
 }
 
 /// Redirect `/dev/tty` onto stdin (fd 0) so the interactive loop can read key
@@ -355,12 +505,75 @@ fn reopen_controlling_tty() -> Result<()> {
 /// Preferred sidebar width in columns (border + content). The sidebar is
 /// hidden when the terminal is too narrow to leave room for the main view.
 const SIDEBAR_W: u16 = 28;
+const BLAME_W: u16 = 18;
+
+fn diff_content_width(main_width: u16, blame_on: bool, wrap: bool, has_blame_rows: bool) -> u16 {
+    if blame_on && !wrap && has_blame_rows && main_width > BLAME_W + 10 {
+        main_width.saturating_sub(BLAME_W)
+    } else {
+        main_width
+    }
+}
 
 /// Clamp a scroll offset to the last scrollable row: `total` lines shown in a
 /// `view_h`-row viewport scroll to at most `total - view_h`. Keeps a preserved
 /// offset in-bounds after the diff shrinks on a live reload.
-fn clamp_offset(offset: u16, total: u16, view_h: u16) -> u16 {
+fn clamp_offset(offset: usize, total: usize, view_h: usize) -> usize {
     offset.min(total.saturating_sub(view_h))
+}
+
+#[derive(Debug, Default)]
+struct VisualRows {
+    starts: Vec<usize>,
+    total: usize,
+    width: u16,
+    wrap: bool,
+}
+
+impl VisualRows {
+    fn build(lines: &[Line<'static>], width: u16, wrap: bool) -> Self {
+        let width = width.max(1);
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut total = 0;
+        for line in lines {
+            starts.push(total);
+            let height = if wrap {
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width)
+                    .max(1)
+            } else {
+                1
+            };
+            total += height;
+        }
+        Self {
+            starts,
+            total,
+            width,
+            wrap,
+        }
+    }
+
+    fn logical_at(&self, visual: usize) -> (usize, usize) {
+        if self.starts.is_empty() {
+            return (0, 0);
+        }
+        let logical = self
+            .starts
+            .partition_point(|&start| start <= visual)
+            .saturating_sub(1)
+            .min(self.starts.len() - 1);
+        (logical, visual.saturating_sub(self.starts[logical]))
+    }
+
+    fn visual_start(&self, logical: usize) -> usize {
+        self.starts.get(logical).copied().unwrap_or(self.total)
+    }
+
+    fn map_starts(&self, logical: &[usize]) -> Vec<usize> {
+        logical.iter().map(|&row| self.visual_start(row)).collect()
+    }
 }
 
 /// Minimum main-content width (columns) at which `--mode auto` switches from the
@@ -419,9 +632,13 @@ fn run_loop(
     reload: Option<ReloadFn>,
     blame_enabled: bool,
     source: DiffSource,
+    context: ReviewContext,
     mut current_text: String,
     live_default: bool,
+    live_explicit: bool,
     live_interval_ms: u64,
+    transparent_background: bool,
+    termination_signal: Arc<AtomicUsize>,
 ) -> Result<()> {
     let mut file_count = model.files.len();
     // Blame gutter (`B`): off until toggled; `blame_cache` maps a file index to
@@ -446,6 +663,7 @@ fn run_loop(
     // always renders, and thereafter only when the effective layout mode, the
     // split column width, or a display toggle changes.
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut visual_rows = VisualRows::default();
     // Plain text of each rendered line, rebuilt alongside `lines`, for search.
     let mut line_texts: Vec<String> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::new();
@@ -460,7 +678,7 @@ fn run_loop(
     // view). A render toggle (like the display toggles) re-renders when it changes.
     let mut expanded_folds: HashSet<FoldId> = HashSet::new();
     let mut summaries = file_summaries(&model);
-    let mut offset: u16 = 0;
+    let mut offset: usize = 0;
     let mut show_help = false;
     // Sidebar starts visible. The active file is DERIVED from the scroll offset
     // every frame (see `file_at_offset`), so plain scrolling moves through files
@@ -477,7 +695,6 @@ fn run_loop(
     // far cheaper and indistinguishable in use; revisit if a diff needs more.
     let mut h_offset: u16 = 0;
     const H_STEP: u16 = 8;
-    const H_MAX: u16 = 512;
     // Active search over the rendered lines (matches + cursor), or `None`. While
     // `search_input` is `Some`, the user is live-typing a query in the prompt;
     // each keystroke recomputes `search` so highlights and the counter update.
@@ -492,6 +709,7 @@ fn run_loop(
     let mut dragged = false;
     let mut selection: Option<(usize, usize)> = None;
     let mut copy_notice: Option<String> = None;
+    let mut reload_notice: Option<String> = None;
 
     // Live auto-refresh: poll the reload source on an interval and rebuild only
     // when the diff text actually changed. On by default for sources whose
@@ -499,11 +717,14 @@ fn run_loop(
     // it; the `L` key toggles it at runtime for any toggleable source. The
     // cadence comes from config (`live_interval_ms`).
     let live_policy = source.live_policy();
-    let mut live_on = live_default && live_policy.default_on && reload.is_some();
+    let mut live_on = initial_live_enabled(source, live_default, live_explicit, reload.is_some());
     let live_interval = Duration::from_millis(live_interval_ms);
     let mut last_fetch = Instant::now();
 
     loop {
+        if termination_signal.load(Ordering::Relaxed) != 0 {
+            break;
+        }
         // Resolve the effective layout from the configured mode + live width so a
         // resize (which changes the width here) re-evaluates `auto` and split
         // column sizing without any extra event.
@@ -542,14 +763,23 @@ fn run_loop(
             if let Some(s) = &search {
                 search = Some(Search::new(s.query.clone(), &line_texts));
             }
+            visual_rows.starts.clear();
+        }
+
+        if visual_rows.starts.len() != lines.len()
+            || visual_rows.width != main_width
+            || visual_rows.wrap != wrap
+        {
+            visual_rows = VisualRows::build(&lines, main_width, wrap);
         }
 
         // Clamp rather than `as u16` so a diff over 65535 lines saturates
         // instead of silently wrapping the scroll bound.
-        let total = lines.len().min(u16::MAX as usize) as u16;
+        let total = visual_rows.total;
+        let (logical_offset, _) = visual_rows.logical_at(offset);
         // Derive the active file from the current scroll offset so the sidebar
         // highlight and the "file X/Y" status follow scrolling for free.
-        let active_file = file_at_offset(&file_starts, offset as usize);
+        let active_file = file_at_offset(&file_starts, logical_offset);
         // Status line for the search prompt / counter, shown in place of the
         // normal status bar while typing a query or with a search active.
         let search_status = search_status_text(search_input.as_deref(), search.as_ref());
@@ -567,6 +797,7 @@ fn run_loop(
             offset,
             h_offset,
             total,
+            visual_rows: &visual_rows,
             wrap,
             sidebar_visible,
             show_help,
@@ -578,6 +809,7 @@ fn run_loop(
             search_status,
             selection,
             copy_notice: copy_notice.clone(),
+            reload_notice: reload_notice.clone(),
             blame_on,
             blame_cache: &blame_cache,
             blame_keys: &blame_keys,
@@ -588,9 +820,18 @@ fn run_loop(
         let mut view_h = 0u16;
         terminal.draw(|frame| view_h = draw_review(frame, &view))?;
 
+        let view_h = view_h as usize;
         let max_offset = total.saturating_sub(view_h);
         offset = clamp_offset(offset, total, view_h);
         let page = view_h.saturating_sub(2).max(1);
+        let content_width = diff_content_width(main_width, blame_on, wrap, !blame_keys.is_empty());
+        let h_max = line_texts
+            .iter()
+            .map(|line| Span::raw(line).width())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(content_width as usize)
+            .min(u16::MAX as usize) as u16;
 
         // Live auto-refresh, gated on its interval so we never spawn git more
         // than once per interval. Compare-before-rebuild: only rebuild when the
@@ -602,25 +843,37 @@ fn run_loop(
         // a mid-save/rebase hiccup never crashes or blanks the view.
         if live_on && last_fetch.elapsed() >= live_interval {
             last_fetch = Instant::now();
-            if let Some(Ok(text)) = reload.as_ref().map(|fetch| fetch()) {
-                // `apply_live_fetch` returns the rebuilt model only when the text
-                // changed; an unchanged diff yields `None`, so the whole block —
-                // including the blame refetch — is skipped (no rebuild, no
-                // `git blame`, no flicker).
-                if let Some(new_model) = apply_live_fetch(&current_text, &text) {
-                    current_text = text;
-                    // Content changed, so a live blame gutter is now stale.
-                    // Re-blame only the files whose diff actually changed; files
-                    // unchanged since the last fetch keep their cached blame
-                    // (their working-tree file is unchanged), so the per-file
-                    // `git blame` cost scopes to the edit, not the whole diff.
-                    if blame_on {
-                        blame_cache = refresh_blame_scoped(&model, &new_model, &blame_cache);
+            if let Some(result) = reload.as_ref().map(|fetch| fetch()) {
+                match result {
+                    Ok(text) => {
+                        reload_notice = None;
+                        // `apply_live_fetch` returns the rebuilt model only when the text
+                        // changed; an unchanged diff yields `None`, so the whole block —
+                        // including the blame refetch — is skipped (no rebuild, no
+                        // `git blame`, no flicker).
+                        if let Some(new_model) = apply_live_fetch(&current_text, &text) {
+                            let mut new_model = new_model;
+                            apply_path_hint(&mut new_model, &context);
+                            current_text = text;
+                            // Content changed, so a live blame gutter is now stale.
+                            if blame_on {
+                                blame_cache = refresh_blame_scoped(
+                                    &model,
+                                    &new_model,
+                                    &blame_cache,
+                                    context.repo_root.as_deref(),
+                                );
+                            }
+                            model = new_model;
+                            summaries = file_summaries(&model);
+                            file_count = model.files.len();
+                            drag_anchor = None;
+                            selection = None;
+                            dragged = false;
+                            needs_render = true;
+                        }
                     }
-                    model = new_model;
-                    summaries = file_summaries(&model);
-                    file_count = model.files.len();
-                    needs_render = true;
+                    Err(error) => reload_notice = Some(format!("reload failed: {error}")),
                 }
             }
         }
@@ -638,8 +891,11 @@ fn run_loop(
                 // Clamp a body row to a valid line index (rows >= view_h are the
                 // status bar). `view_h == 0` on the first frame -> no lines yet.
                 let line_at = |row: u16| {
-                    let r = (row as usize).min(view_h.saturating_sub(1) as usize);
-                    (offset as usize + r).min(lines.len().saturating_sub(1))
+                    let r = (row as usize).min(view_h.saturating_sub(1));
+                    visual_rows
+                        .logical_at(offset + r)
+                        .0
+                        .min(lines.len().saturating_sub(1))
                 };
                 match me.kind {
                     MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
@@ -651,7 +907,7 @@ fn run_loop(
                     // (one logical line spans several rows), so it's disabled then.
                     MouseEventKind::Down(MouseButton::Left) if !wrap && !lines.is_empty() => {
                         copy_notice = None;
-                        if (me.row as usize) < view_h as usize {
+                        if (me.row as usize) < view_h {
                             let l = line_at(me.row);
                             drag_anchor = Some(l);
                             dragged = false;
@@ -712,7 +968,8 @@ fn run_loop(
                         theme_cursor = theme_cursor.saturating_sub(1);
                     }
                     KeyCode::Enter => {
-                        theme = catalog[theme_cursor].clone();
+                        theme =
+                            selected_theme(catalog[theme_cursor].clone(), transparent_background);
                         highlighter =
                             Highlighter::with_theme(&theme.syntect_theme, &theme.syntax_overrides);
                         needs_render = true;
@@ -760,7 +1017,7 @@ fn run_loop(
                 if recompute {
                     let q = search_input.clone().unwrap_or_default();
                     let s = Search::new(q, &line_texts);
-                    jump_to_match(&s, &mut offset, &mut h_offset, max_offset);
+                    jump_to_match(&s, &visual_rows, &mut offset, &mut h_offset, max_offset);
                     search = Some(s);
                 }
                 continue;
@@ -768,19 +1025,21 @@ fn run_loop(
             // Scroll + file/hunk navigation are pure offset math, extracted into
             // `scroll_offset` so they can be unit-tested. Handle them first;
             // every other key falls through to the match below.
+            let visual_file_starts = visual_rows.map_starts(&file_starts);
+            let visual_hunk_starts = visual_rows.map_starts(&hunk_starts);
             if let Some(new_offset) = scroll_offset(
                 key.code,
                 offset,
                 page,
                 max_offset,
-                &file_starts,
-                &hunk_starts,
+                &visual_file_starts,
+                &visual_hunk_starts,
             ) {
                 offset = new_offset;
                 continue;
             }
             // Horizontal scroll (left/right arrows) when not wrapping.
-            if let Some(nh) = h_scroll_offset(key.code, h_offset, H_STEP, H_MAX, wrap) {
+            if let Some(nh) = h_scroll_offset(key.code, h_offset, H_STEP, h_max, wrap) {
                 h_offset = nh;
                 continue;
             }
@@ -799,9 +1058,10 @@ fn run_loop(
                 // Open the active file (derived from the scroll offset) in
                 // $EDITOR. No-op when the diff has no files.
                 KeyCode::Char('e') => {
-                    let active = file_at_offset(&file_starts, offset as usize);
+                    let active = file_at_offset(&file_starts, visual_rows.logical_at(offset).0);
                     if let Some(summary) = summaries.get(active) {
-                        open_in_editor(terminal, &summary.path);
+                        let path = review_path(&context, summary);
+                        open_in_editor(terminal, &path);
                     }
                 }
                 // Reload: re-fetch the diff from its source and rebuild the
@@ -811,28 +1071,38 @@ fn run_loop(
                 // since line indices and fold ids change with the new diff.
                 KeyCode::Char('r') => {
                     if let Some(fetch) = &reload {
-                        if let Ok(text) = fetch() {
-                            model = build_model(&text);
-                            // Track the reloaded text so the next live-poll's
-                            // compare-before-rebuild sees it unchanged and skips
-                            // a redundant fetch+rebuild right after `r`.
-                            current_text = text;
-                            summaries = file_summaries(&model);
-                            file_count = model.files.len();
-                            offset = 0;
-                            h_offset = 0;
-                            expanded_folds.clear();
-                            search = None;
-                            // The new model may have a different file set/order,
-                            // so the old blame cache (keyed by file index) is
-                            // stale — refetch against the new files when blame is
-                            // on, else just drop it.
-                            blame_cache = if blame_on {
-                                fetch_all_blame(&summaries)
-                            } else {
-                                HashMap::new()
-                            };
-                            needs_render = true;
+                        match fetch() {
+                            Ok(text) => {
+                                reload_notice = None;
+                                model = build_model(&text);
+                                apply_path_hint(&mut model, &context);
+                                // Track the reloaded text so the next live-poll's
+                                // compare-before-rebuild sees it unchanged and skips
+                                // a redundant fetch+rebuild right after `r`.
+                                current_text = text;
+                                summaries = file_summaries(&model);
+                                file_count = model.files.len();
+                                offset = 0;
+                                h_offset = 0;
+                                expanded_folds.clear();
+                                search = None;
+                                drag_anchor = None;
+                                selection = None;
+                                dragged = false;
+                                // The new model may have a different file set/order,
+                                // so the old blame cache (keyed by file index) is
+                                // stale — refetch against the new files when blame is
+                                // on, else just drop it.
+                                blame_cache = if blame_on {
+                                    fetch_all_blame(&summaries, context.repo_root.as_deref())
+                                } else {
+                                    HashMap::new()
+                                };
+                                needs_render = true;
+                            }
+                            Err(error) => {
+                                reload_notice = Some(format!("reload failed: {error}"));
+                            }
                         }
                     }
                 }
@@ -857,7 +1127,7 @@ fn run_loop(
                 KeyCode::Char('N') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.prev();
-                        jump_to_match(s, &mut offset, &mut h_offset, max_offset);
+                        jump_to_match(s, &visual_rows, &mut offset, &mut h_offset, max_offset);
                     }
                 }
                 // Display toggles: flip the option and re-render the lines.
@@ -866,13 +1136,18 @@ fn run_loop(
                 KeyCode::Char('n') => {
                     if let Some(s) = search.as_mut().filter(|s| !s.is_empty()) {
                         s.next();
-                        jump_to_match(s, &mut offset, &mut h_offset, max_offset);
+                        jump_to_match(s, &visual_rows, &mut offset, &mut h_offset, max_offset);
                     } else {
                         opts.line_numbers = !opts.line_numbers;
                         needs_render = true;
                     }
                 }
-                KeyCode::Char('w') => wrap = !wrap,
+                KeyCode::Char('w') => {
+                    let logical = visual_rows.logical_at(offset).0;
+                    wrap = !wrap;
+                    visual_rows = VisualRows::build(&lines, main_width, wrap);
+                    offset = visual_rows.visual_start(logical);
+                }
                 KeyCode::Char('H') => {
                     opts.hunk_headers = !opts.hunk_headers;
                     needs_render = true;
@@ -885,7 +1160,7 @@ fn run_loop(
                 // expand all (`O`), or collapse all (`C`). `fold_bars` lists every
                 // fold's bar row, so expand-all just inserts them all.
                 KeyCode::Char('o') | KeyCode::Enter => {
-                    if let Some(id) = fold_at_cursor(&fold_bars, offset as usize) {
+                    if let Some(id) = fold_at_cursor(&fold_bars, visual_rows.logical_at(offset).0) {
                         // insert() returns false when already expanded -> collapse it.
                         if !expanded_folds.insert(id) {
                             expanded_folds.remove(&id);
@@ -927,7 +1202,7 @@ fn run_loop(
                 KeyCode::Char('B') if blame_enabled => {
                     blame_on = !blame_on;
                     if blame_on && blame_cache.is_empty() {
-                        blame_cache = fetch_all_blame(&summaries);
+                        blame_cache = fetch_all_blame(&summaries, context.repo_root.as_deref());
                     }
                 }
                 // Toggle live auto-refresh. A no-op on sources that can never go
@@ -977,24 +1252,67 @@ fn editor_command(visual: Option<&str>, editor: Option<&str>) -> (String, Vec<St
     (program, args)
 }
 
+/// Build the complete editor invocation, including the file path.
+fn editor_invocation(
+    visual: Option<&str>,
+    editor: Option<&str>,
+    path: &Path,
+) -> (String, Vec<OsString>) {
+    let (program, args) = editor_command(visual, editor);
+    let mut args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+    args.push(OsString::from("--"));
+    args.push(path.as_os_str().to_os_string());
+    (program, args)
+}
+
+fn review_path(context: &ReviewContext, summary: &FileSummary) -> PathBuf {
+    if let Some(path) = &context.editor_target {
+        return path.clone();
+    }
+    let native = path_from_bytes(&summary.path_bytes, &summary.path);
+    match &context.repo_root {
+        Some(root) => root.join(native),
+        None => native,
+    }
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8], _display: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(_bytes: &[u8], display: &str) -> PathBuf {
+    PathBuf::from(display)
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
 /// Suspend the TUI, run `$EDITOR <path>` as a foreground child (inheriting our
 /// stdio so the editor takes over the terminal), then re-enter the alternate
 /// screen. The path is a discrete arg-vector element appended after the
 /// editor's base args, so there is no shell and nothing in it can be
 /// interpreted as a command. Best-effort: a spawn failure must not break the
 /// review, but we always re-enter the UI afterwards.
-fn open_in_editor(terminal: &mut DefaultTerminal, path: &str) {
+fn open_in_editor(terminal: &mut DefaultTerminal, path: &Path) {
     let visual = std::env::var("VISUAL").ok();
     let editor = std::env::var("EDITOR").ok();
-    let (program, args) = editor_command(visual.as_deref(), editor.as_deref());
+    let (program, args) = editor_invocation(visual.as_deref(), editor.as_deref(), path);
 
     // Leave the alternate screen + raw mode (and mouse capture) so the editor
     // owns the terminal.
     restore_review_terminal();
-    let _ = std::process::Command::new(&program)
-        .args(&args)
-        .arg(path)
-        .status();
+    let _ = std::process::Command::new(&program).args(&args).status();
     // Re-enter our UI regardless of how (or whether) the editor ran. The next
     // loop iteration redraws.
     *terminal = init_review_terminal();
@@ -1027,11 +1345,12 @@ struct ReviewFrame<'a> {
     theme: &'a Theme,
     file_count: usize,
     selected_file: usize,
-    offset: u16,
+    offset: usize,
     /// Horizontal scroll offset in columns (0 unless the user arrowed sideways).
     h_offset: u16,
     /// Total rendered line count (already clamped to `u16::MAX`).
-    total: u16,
+    total: usize,
+    visual_rows: &'a VisualRows,
     wrap: bool,
     sidebar_visible: bool,
     show_help: bool,
@@ -1051,6 +1370,8 @@ struct ReviewFrame<'a> {
     selection: Option<(usize, usize)>,
     /// Transient "copied N lines" notice shown in the status bar after a copy.
     copy_notice: Option<String>,
+    /// Most recent automatic/manual reload error, cleared on recovery.
+    reload_notice: Option<String>,
     /// Whether the blame gutter is shown (stack layout only).
     blame_on: bool,
     /// Per-file `git blame`, indexed by file then new-side line (0-based).
@@ -1080,7 +1401,10 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     let main = if v.sidebar_visible && body.width >= SIDEBAR_W + 20 {
         let panes =
             Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(0)]).split(body);
-        frame.render_widget(sidebar(v.summaries, v.selected_file, v.theme), panes[0]);
+        frame.render_widget(
+            sidebar(v.summaries, v.selected_file, v.theme, panes[0].height),
+            panes[0],
+        );
         panes[1]
     } else {
         body
@@ -1091,12 +1415,17 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     // (split/vertical leave `blame_keys` empty, so this is skipped there).
     // Suppressed while wrapping: a wrapped logical line spans several terminal
     // rows, but the gutter is one row per logical line, so it can't stay aligned.
-    const BLAME_W: u16 = 18;
     let main = if v.blame_on && !v.wrap && !v.blame_keys.is_empty() && main.width > BLAME_W + 10 {
         let cols =
             Layout::horizontal([Constraint::Length(BLAME_W), Constraint::Min(0)]).split(main);
-        let gutter = blame_gutter_lines(v, BLAME_W as usize);
-        frame.render_widget(Paragraph::new(gutter).scroll((v.offset, 0)), cols[0]);
+        let mut gutter = blame_gutter_lines(v, BLAME_W as usize);
+        let gutter_scroll = if v.wrap {
+            v.offset.min(u16::MAX as usize) as u16
+        } else {
+            gutter = gutter.into_iter().skip(v.offset).collect();
+            0
+        };
+        frame.render_widget(Paragraph::new(gutter).scroll((gutter_scroll, 0)), cols[0]);
         cols[1]
     } else {
         main
@@ -1135,19 +1464,30 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
             }
         }
     }
-    let mut paragraph = Paragraph::new(display_lines).scroll((v.offset, v.h_offset));
+    let (logical_start, intra_line) = v.visual_rows.logical_at(v.offset);
+    display_lines = display_lines.into_iter().skip(logical_start).collect();
+    let local_offset = if v.wrap {
+        intra_line.min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
+    let mut paragraph = Paragraph::new(display_lines).scroll((local_offset, v.h_offset));
     if v.wrap {
         // `trim: false` keeps leading indentation when wrapping.
         paragraph = paragraph.wrap(Wrap { trim: false });
     }
     frame.render_widget(paragraph, main);
 
-    let max_off = v.total.saturating_sub(main.height);
-    if let Some(text) = v.search_status.as_ref().or(v.copy_notice.as_ref()) {
+    let max_off = v.total.saturating_sub(main.height as usize);
+    if let Some(text) = status_notice(
+        v.search_status.as_deref(),
+        v.copy_notice.as_deref(),
+        v.reload_notice.as_deref(),
+    ) {
         // The search prompt/counter (or, after a copy, the copy notice) takes
         // over the status line.
         frame.render_widget(
-            Paragraph::new(Line::from(text.clone()))
+            Paragraph::new(Line::from(text.to_string()))
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             chunks[1],
         );
@@ -1177,18 +1517,26 @@ fn draw_review(frame: &mut Frame, v: &ReviewFrame) -> u16 {
     main.height
 }
 
+fn status_notice<'a>(
+    search: Option<&'a str>,
+    copy: Option<&'a str>,
+    reload: Option<&'a str>,
+) -> Option<&'a str> {
+    search.or(copy).or(reload)
+}
+
 /// Compute the new scroll offset for the scroll / file-navigation keys, or
 /// `None` when `key` is not one of them (the caller then handles it). Pure: all
 /// inputs are passed in, so it is unit-testable without a terminal. The
 /// expressions mirror the inline arms they replaced, so behavior is unchanged.
 fn scroll_offset(
     key: KeyCode,
-    offset: u16,
-    page: u16,
-    max_offset: u16,
+    offset: usize,
+    page: usize,
+    max_offset: usize,
     file_starts: &[usize],
     hunk_starts: &[usize],
-) -> Option<u16> {
+) -> Option<usize> {
     // Half a page (>= 1) for the `d`/`u` keys.
     let half = (page / 2).max(1);
     let new_offset = match key {
@@ -1206,7 +1554,7 @@ fn scroll_offset(
             if file_starts.is_empty() {
                 return None;
             }
-            let current = file_at_offset(file_starts, offset as usize);
+            let current = file_at_offset(file_starts, offset);
             let target = (current + 1).min(file_starts.len() - 1);
             file_to_offset(file_starts, target, max_offset)
         }
@@ -1214,7 +1562,7 @@ fn scroll_offset(
             if file_starts.is_empty() {
                 return None;
             }
-            let current = file_at_offset(file_starts, offset as usize);
+            let current = file_at_offset(file_starts, offset);
             let target = current.saturating_sub(1);
             file_to_offset(file_starts, target, max_offset)
         }
@@ -1228,7 +1576,7 @@ fn scroll_offset(
                 return None;
             }
             let target = hunk_starts
-                .partition_point(|&s| s <= offset as usize)
+                .partition_point(|&s| s <= offset)
                 .min(hunk_starts.len() - 1);
             file_to_offset(hunk_starts, target, max_offset)
         }
@@ -1237,7 +1585,7 @@ fn scroll_offset(
                 return None;
             }
             let target = hunk_starts
-                .partition_point(|&s| s < offset as usize)
+                .partition_point(|&s| s < offset)
                 .saturating_sub(1);
             file_to_offset(hunk_starts, target, max_offset)
         }
@@ -1262,12 +1610,17 @@ fn h_scroll_offset(key: KeyCode, h: u16, step: u16, max: u16, wrap: bool) -> Opt
 }
 
 /// Lines the mouse wheel scrolls per notch.
-const WHEEL_LINES: u16 = 3;
+const WHEEL_LINES: usize = 3;
 
 /// New vertical offset for a mouse-wheel event, or `None` when the event isn't a
 /// scroll (so the caller ignores it). Pure, mirroring `scroll_offset`, so the
 /// wheel mapping is unit-testable without a terminal.
-fn wheel_scroll(kind: MouseEventKind, offset: u16, step: u16, max_offset: u16) -> Option<u16> {
+fn wheel_scroll(
+    kind: MouseEventKind,
+    offset: usize,
+    step: usize,
+    max_offset: usize,
+) -> Option<usize> {
     match kind {
         MouseEventKind::ScrollDown => Some((offset + step).min(max_offset)),
         MouseEventKind::ScrollUp => Some(offset.saturating_sub(step)),
@@ -1288,11 +1641,15 @@ fn write_osc52_copy(text: &str) -> std::io::Result<()> {
 /// Fetch `git blame` (working tree) for every file in `summaries`, keyed by file
 /// index. A file whose blame fails (e.g. revu launched from a subdir) is simply
 /// omitted, so its gutter renders blank rather than wrong.
-fn fetch_all_blame(summaries: &[FileSummary]) -> HashMap<usize, Vec<crate::blame::BlameLine>> {
-    let adapter = GitAdapter::new();
+fn fetch_all_blame(
+    summaries: &[FileSummary],
+    repo_root: Option<&Path>,
+) -> HashMap<usize, Vec<crate::blame::BlameLine>> {
+    let adapter = repo_root.map_or_else(GitAdapter::new, GitAdapter::at);
     let mut cache = HashMap::new();
     for (idx, summary) in summaries.iter().enumerate() {
-        if let Ok(porcelain) = adapter.blame(None, &summary.path) {
+        let path = path_from_bytes(&summary.path_bytes, &summary.path);
+        if let Ok(porcelain) = adapter.blame(None, &path) {
             cache.insert(idx, crate::blame::parse_blame(&porcelain));
         }
     }
@@ -1309,11 +1666,14 @@ fn refresh_blame_scoped(
     old_model: &DiffModel,
     new_model: &DiffModel,
     old_cache: &HashMap<usize, Vec<crate::blame::BlameLine>>,
+    repo_root: Option<&Path>,
 ) -> HashMap<usize, Vec<crate::blame::BlameLine>> {
     let (mut cache, to_fetch) = plan_blame_reuse(old_model, new_model, old_cache);
-    let adapter = GitAdapter::new();
+    let adapter = repo_root.map_or_else(GitAdapter::new, GitAdapter::at);
     for idx in to_fetch {
-        if let Ok(porcelain) = adapter.blame(None, &new_model.files[idx].path) {
+        let file = &new_model.files[idx];
+        let path = path_from_bytes(&file.path_bytes, &file.path);
+        if let Ok(porcelain) = adapter.blame(None, &path) {
             cache.insert(idx, crate::blame::parse_blame(&porcelain));
         }
     }
@@ -1381,16 +1741,32 @@ fn blame_cell(v: &ReviewFrame, row: usize, width: usize) -> String {
 /// is left-aligned and truncated to leave room for a space and the age; the
 /// whole thing is padded or clamped to `width`. Pure, so it is unit-testable.
 fn format_blame_cell(author: &str, age: &str, width: usize) -> String {
-    let age_w = age.chars().count();
+    let age_w = Span::raw(age).width();
     let author_w = width.saturating_sub(age_w + 1).max(1);
-    let author: String = author.chars().take(author_w).collect();
-    let cell = format!("{author:<author_w$} {age}");
-    let len = cell.chars().count();
+    let author = take_display_prefix(author, author_w);
+    let author_pad = author_w.saturating_sub(Span::raw(&author).width());
+    let cell = format!("{author}{} {age}", " ".repeat(author_pad));
+    let len = Span::raw(&cell).width();
     if len < width {
         format!("{cell}{}", " ".repeat(width - len))
     } else {
-        cell.chars().take(width).collect()
+        take_display_prefix(&cell, width)
     }
+}
+
+fn take_display_prefix(text: &str, max: usize) -> String {
+    let span = Span::raw(text);
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in span.styled_graphemes(Style::default()) {
+        let width = Span::raw(grapheme.symbol).width();
+        if used + width > max {
+            break;
+        }
+        out.push_str(grapheme.symbol);
+        used += width;
+    }
+    out
 }
 
 /// The blame gutter as one `Line` per rendered row (parallel to `v.lines`), so a
@@ -1405,22 +1781,23 @@ fn blame_gutter_lines(v: &ReviewFrame, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Map a selected file index to a clamped scroll offset for the main view.
-fn file_to_offset(file_starts: &[usize], idx: usize, max_offset: u16) -> u16 {
+fn file_to_offset(file_starts: &[usize], idx: usize, max_offset: usize) -> usize {
     let start = file_starts.get(idx).copied().unwrap_or(0);
-    (start.min(u16::MAX as usize) as u16).min(max_offset)
-}
-
-/// Scroll offset that brings match `m` into view (at the viewport top), clamped.
-fn match_offset(m: Match, max_offset: u16) -> u16 {
-    (m.line.min(u16::MAX as usize) as u16).min(max_offset)
+    start.min(max_offset)
 }
 
 /// After the search cursor moves, scroll so the current match sits at the
 /// viewport top (clamped) and reset the horizontal offset so the match isn't
 /// scrolled off-screen to the left. No-op when the search matched nothing.
-fn jump_to_match(search: &Search, offset: &mut u16, h_offset: &mut u16, max_offset: u16) {
+fn jump_to_match(
+    search: &Search,
+    visual_rows: &VisualRows,
+    offset: &mut usize,
+    h_offset: &mut u16,
+    max_offset: usize,
+) {
     if let Some(m) = search.current_match() {
-        *offset = match_offset(m, max_offset);
+        *offset = visual_rows.visual_start(m.line).min(max_offset);
         *h_offset = 0;
     }
 }
@@ -1505,15 +1882,29 @@ fn highlight_line(
 /// Truncate a path to `max` columns, keeping the tail (the filename is the most
 /// useful part) and marking the cut with a leading `..`.
 fn truncate_path(path: &str, max: usize) -> String {
-    let count = path.chars().count();
-    if count <= max {
+    let span = Span::raw(path);
+    if span.width() <= max {
         return path.to_string();
     }
+    let graphemes: Vec<&str> = span
+        .styled_graphemes(Style::default())
+        .map(|grapheme| grapheme.symbol)
+        .collect();
     if max <= 2 {
-        return path.chars().take(max).collect();
+        return take_display_prefix(path, max);
     }
-    let keep = max - 2;
-    let tail: String = path.chars().skip(count - keep).collect();
+    let mut tail_parts = Vec::new();
+    let mut used = 0;
+    for grapheme in graphemes.into_iter().rev() {
+        let width = Span::raw(grapheme).width();
+        if used + width > max - 2 {
+            break;
+        }
+        tail_parts.push(grapheme);
+        used += width;
+    }
+    tail_parts.reverse();
+    let tail = tail_parts.concat();
     format!("..{tail}")
 }
 
@@ -1523,7 +1914,12 @@ fn truncate_path(path: &str, max: usize) -> String {
 ///
 /// ponytail: no internal scrolling — if there are more files than rows, the
 /// overflow is clipped. Fine for typical review sizes; revisit for huge diffs.
-fn sidebar(summaries: &[FileSummary], selected: usize, theme: &Theme) -> Paragraph<'static> {
+fn sidebar(
+    summaries: &[FileSummary],
+    selected: usize,
+    theme: &Theme,
+    height: u16,
+) -> Paragraph<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" files ")
@@ -1531,14 +1927,19 @@ fn sidebar(summaries: &[FileSummary], selected: usize, theme: &Theme) -> Paragra
     // Inner content width = sidebar width minus the two border columns.
     let inner_w = (SIDEBAR_W as usize).saturating_sub(2);
 
+    let visible = height.saturating_sub(2) as usize;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(summaries.len().saturating_sub(visible));
     let mut rows: Vec<Line<'static>> = Vec::new();
-    for (i, s) in summaries.iter().enumerate() {
+    for (i, s) in summaries.iter().enumerate().skip(start).take(visible) {
         let counts = format!("+{} -{}", s.additions, s.deletions);
         // Reserve room for the counts (plus a one-column gap); the rest is the
         // path budget.
         let path_budget = inner_w.saturating_sub(counts.len() + 1).max(1);
         let path = truncate_path(&s.path, path_budget);
-        let pad = inner_w.saturating_sub(path.chars().count() + counts.len());
+        let pad = inner_w.saturating_sub(Span::raw(&path).width() + counts.len());
 
         if i == selected {
             // Selected: one reversed+bold span spanning the inner width.
@@ -1570,8 +1971,8 @@ fn sidebar(summaries: &[FileSummary], selected: usize, theme: &Theme) -> Paragra
 fn status_bar(
     file_count: usize,
     selected_file: usize,
-    offset: u16,
-    max_offset: u16,
+    offset: usize,
+    max_offset: usize,
     opts: &RenderOptions,
     wrap: bool,
     theme: &Theme,
@@ -1581,7 +1982,11 @@ fn status_bar(
     let pct = if max_offset == 0 {
         100
     } else {
-        (offset as usize * 100 / max_offset as usize).min(100)
+        offset
+            .saturating_mul(100)
+            .checked_div(max_offset)
+            .unwrap_or(100)
+            .min(100)
     };
 
     // Show only the toggles that are currently ON, mirroring the help labels.
@@ -1825,6 +2230,155 @@ index 5555555..6666666 100644
     }
 
     #[test]
+    fn editor_argv_places_terminator_before_path() {
+        let (program, args) = editor_invocation(None, Some("vim -f"), Path::new("+!touch PWN"));
+        assert_eq!(program, "vim");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-f"),
+                OsString::from("--"),
+                OsString::from("+!touch PWN")
+            ]
+        );
+    }
+
+    #[test]
+    fn review_path_uses_repo_root_or_authoritative_target() {
+        let summary = FileSummary {
+            path: "sub/file.rs".to_string(),
+            path_bytes: b"sub/file.rs".to_vec(),
+            additions: 0,
+            deletions: 0,
+        };
+        let rooted = ReviewContext {
+            repo_root: Some(PathBuf::from("/repo")),
+            editor_target: None,
+        };
+        assert_eq!(
+            review_path(&rooted, &summary),
+            PathBuf::from("/repo/sub/file.rs")
+        );
+
+        let direct = ReviewContext {
+            repo_root: Some(PathBuf::from("/repo")),
+            editor_target: Some(PathBuf::from("/tmp/right.rs")),
+        };
+        assert_eq!(
+            review_path(&direct, &summary),
+            PathBuf::from("/tmp/right.rs")
+        );
+    }
+
+    #[test]
+    fn explicit_cli_view_flags_win_over_saved_state() {
+        let mut opts = RenderOptions::default();
+        let mut wrap = true;
+        let state = ViewState {
+            line_numbers: true,
+            wrap_lines: false,
+            hunk_headers: true,
+            context_collapsed: true,
+        };
+        let overrides = ConfigOverrides {
+            line_numbers: Some(false),
+            wrap_lines: Some(true),
+            hunk_headers: Some(false),
+            ..ConfigOverrides::default()
+        };
+        opts.line_numbers = false;
+        opts.hunk_headers = false;
+        apply_saved_view_state(&mut opts, &mut wrap, Some(state), &overrides);
+        assert!(!opts.line_numbers);
+        assert!(!opts.hunk_headers);
+        assert!(wrap);
+        assert!(opts.context_collapsed);
+    }
+
+    #[test]
+    fn saved_state_wins_when_cli_flags_are_absent() {
+        let mut opts = RenderOptions::default();
+        let mut wrap = false;
+        let state = ViewState {
+            line_numbers: false,
+            wrap_lines: true,
+            hunk_headers: false,
+            context_collapsed: true,
+        };
+        apply_saved_view_state(
+            &mut opts,
+            &mut wrap,
+            Some(state),
+            &ConfigOverrides::default(),
+        );
+        assert!(!opts.line_numbers);
+        assert!(!opts.hunk_headers);
+        assert!(wrap);
+        assert!(opts.context_collapsed);
+    }
+
+    #[test]
+    fn live_theme_selection_preserves_transparent_background() {
+        let opaque = Theme::default();
+        assert_ne!(opaque.add_bg, Color::Reset);
+        let transparent = selected_theme(opaque, true);
+        assert_eq!(transparent.add_bg, Color::Reset);
+        assert_eq!(transparent.remove_bg, Color::Reset);
+    }
+
+    #[test]
+    fn explicit_live_enables_two_file_source_and_errors_are_visible() {
+        assert!(!initial_live_enabled(
+            DiffSource::TwoFile,
+            true,
+            false,
+            true
+        ));
+        assert!(initial_live_enabled(DiffSource::TwoFile, true, true, true));
+        assert!(!initial_live_enabled(
+            DiffSource::TwoFile,
+            false,
+            true,
+            true
+        ));
+        assert!(!initial_live_enabled(DiffSource::Fixed, true, true, true));
+        assert_eq!(
+            status_notice(None, None, Some("reload failed: git diff failed")),
+            Some("reload failed: git diff failed")
+        );
+        assert_eq!(
+            status_notice(Some("/query"), None, Some("reload failed")),
+            Some("/query")
+        );
+    }
+
+    #[test]
+    fn panic_cleanup_emits_disable_mouse_capture_sequence() {
+        let mut bytes = Vec::new();
+        write_mouse_disable(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("\x1b[?1000l"),
+            "mouse disable missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn visual_rows_count_wrap_and_reach_past_u16() {
+        let lines = vec![Line::from("abcdefghij"), Line::from("x")];
+        let wrapped = VisualRows::build(&lines, 5, true);
+        assert_eq!(wrapped.starts, vec![0, 2]);
+        assert_eq!(wrapped.total, 3);
+        assert_eq!(wrapped.logical_at(1), (0, 1));
+        assert_eq!(wrapped.logical_at(2), (1, 0));
+
+        let large = vec![Line::from("x"); 70_000];
+        let rows = VisualRows::build(&large, 80, false);
+        assert_eq!(rows.visual_start(65_536), 65_536);
+        assert_eq!(rows.logical_at(69_999), (69_999, 0));
+    }
+
+    #[test]
     fn renders_sidebar_and_main_view() {
         let model = parse_unified_diff_colored(MULTI_FILE);
         let highlighter = Highlighter::new();
@@ -1836,9 +2390,10 @@ index 5555555..6666666 100644
 
         // Select the second file and scroll the main view to its start.
         let selected_file = 1;
-        let offset = rendered.file_starts[selected_file] as u16;
+        let offset = rendered.file_starts[selected_file];
         let blame_empty: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
         let blame_keys_empty: HashMap<usize, (usize, usize)> = HashMap::new();
+        let visual_rows = VisualRows::build(&rendered.lines, 80, false);
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
@@ -1848,7 +2403,8 @@ index 5555555..6666666 100644
             selected_file,
             offset,
             h_offset: 0,
-            total: rendered.lines.len() as u16,
+            total: rendered.lines.len(),
+            visual_rows: &visual_rows,
             wrap: false,
             sidebar_visible: true,
             show_help: false,
@@ -1860,6 +2416,7 @@ index 5555555..6666666 100644
             search_status: None,
             selection: None,
             copy_notice: None,
+            reload_notice: None,
             blame_on: false,
             blame_cache: &blame_empty,
             blame_keys: &blame_keys_empty,
@@ -1904,6 +2461,7 @@ index 5555555..6666666 100644
             blame_cache.insert(f, blines.clone());
         }
         let summaries = file_summaries(&model);
+        let visual_rows = VisualRows::build(&rendered.lines, 80, false);
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
@@ -1913,7 +2471,8 @@ index 5555555..6666666 100644
             selected_file: 0,
             offset: 0,
             h_offset: 0,
-            total: rendered.lines.len() as u16,
+            total: rendered.lines.len(),
+            visual_rows: &visual_rows,
             wrap: false,
             sidebar_visible: false, // full width to the diff + blame column
             show_help: false,
@@ -1925,6 +2484,7 @@ index 5555555..6666666 100644
             search_status: None,
             selection: None,
             copy_notice: None,
+            reload_notice: None,
             blame_on: true,
             blame_cache: &blame_cache,
             blame_keys: &rendered.blame_keys,
@@ -1977,6 +2537,9 @@ index 5555555..6666666 100644
         assert_eq!(main_content_width(160, false), 160);
         // Too narrow for the sidebar: it is dropped, so full width.
         assert_eq!(main_content_width(30, true), 30);
+        assert_eq!(diff_content_width(100, true, false, true), 82);
+        assert_eq!(diff_content_width(100, false, false, true), 100);
+        assert_eq!(diff_content_width(100, true, true, true), 100);
     }
 
     #[test]
@@ -2019,6 +2582,11 @@ index 5555555..6666666 100644
         );
         // A non-scroll key returns None so the caller handles it.
         assert_eq!(scroll_offset(KeyCode::Char('x'), 0, 10, 80, fs, hs), None);
+        assert_eq!(
+            scroll_offset(KeyCode::End, 0, 20, 70_000, fs, hs),
+            Some(70_000),
+            "viewport state must reach rows past u16::MAX"
+        );
     }
 
     #[test]
@@ -2254,6 +2822,7 @@ index 5555555..6666666 100644
         let summaries = file_summaries(&model);
         let blame_empty: HashMap<usize, Vec<crate::blame::BlameLine>> = HashMap::new();
         let blame_keys_empty: HashMap<usize, (usize, usize)> = HashMap::new();
+        let visual_rows = VisualRows::build(&rendered.lines, main_width, false);
         let view = ReviewFrame {
             lines: &rendered.lines,
             summaries: &summaries,
@@ -2263,7 +2832,8 @@ index 5555555..6666666 100644
             selected_file: 0,
             offset: 0,
             h_offset: 0,
-            total: rendered.lines.len() as u16,
+            total: rendered.lines.len(),
+            visual_rows: &visual_rows,
             wrap: false,
             sidebar_visible,
             show_help: false,
@@ -2275,6 +2845,7 @@ index 5555555..6666666 100644
             search_status: None,
             selection: None,
             copy_notice: None,
+            reload_notice: None,
             blame_on: false,
             blame_cache: &blame_empty,
             blame_keys: &blame_keys_empty,

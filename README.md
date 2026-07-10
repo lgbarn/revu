@@ -134,6 +134,7 @@ Display flags — override the config file, and are accepted by `diff`, `show`,
 | `--line-numbers` / `--no-line-numbers` | Show / hide the line-number gutter |
 | `--wrap` / `--no-wrap` | Wrap / truncate long lines |
 | `--hunk-headers` / `--no-hunk-headers` | Show / hide `@@` hunk headers |
+| `--live` / `--no-live` | Enable / disable automatic refresh for reloadable sources |
 
 Each display flag mirrors a key in `config.toml` (see [Configuration](#configuration));
 the CLI flag wins when both are set.
@@ -151,6 +152,7 @@ the CLI flag wins when both are set.
 | `w` | line wrap | `e` | open file in `$EDITOR` |
 | `H` | hunk headers | `r` | reload diff from source |
 | `c` | collapse all context | `B` | blame gutter (working-tree diff) |
+| `L` | toggle live refresh | | |
 | `o` / `Enter` | toggle fold at cursor | `O` / `C` | expand / collapse all folds |
 | mouse wheel | scroll | drag | select lines; release copies (OSC52) |
 | `?` | help | `Ctrl-Z` | suspend (resume with `fg`) |
@@ -168,6 +170,8 @@ line_numbers = true
 wrap_lines = false
 hunk_headers = true
 transparent_background = false   # true: use the terminal's background, not the theme's
+live = true              # automatic refresh for working-tree/staged diffs
+live_interval_ms = 1000  # refresh interval; minimum 250 ms
 
 [custom_theme]          # optional: override a base theme
 base = "dracula"

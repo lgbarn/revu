@@ -15,6 +15,12 @@ use crate::diff::{DiffModel, Hunk, LineKind};
 /// type of [`crate::diff::DiffLine::emphasis`].
 pub type ByteRanges = Vec<(usize, usize)>;
 
+/// Maximum line length sent through the quadratic worst-case word matcher.
+/// Longer changed lines fall back to whole-line emphasis so rendering remains
+/// responsive on generated/minified input.
+const MAX_WORD_DIFF_BYTES: usize = 64 * 1024;
+const MAX_WORD_DIFF_TOKENS: usize = 4 * 1024;
+
 /// Fill [`crate::diff::DiffLine::emphasis`] across every hunk of `model` with word-level
 /// changed byte ranges. Idempotent-ish: it overwrites any existing emphasis.
 pub fn compute_word_emphasis(model: &mut DiffModel) {
@@ -84,6 +90,30 @@ fn emphasize_hunk(hunk: &mut Hunk) {
 /// Public so the renderer's tests — and a future split layout — can reuse the
 /// exact span computation.
 pub fn word_emphasis(old: &str, new: &str) -> (ByteRanges, ByteRanges) {
+    if old == new {
+        return (Vec::new(), Vec::new());
+    }
+    let too_many_tokens = |line: &str| {
+        line.split_whitespace()
+            .take(MAX_WORD_DIFF_TOKENS + 1)
+            .count()
+            > MAX_WORD_DIFF_TOKENS
+    };
+    if old.len() > MAX_WORD_DIFF_BYTES
+        || new.len() > MAX_WORD_DIFF_BYTES
+        || too_many_tokens(old)
+        || too_many_tokens(new)
+    {
+        let old_ranges = (!old.is_empty())
+            .then_some((0, old.len()))
+            .into_iter()
+            .collect();
+        let new_ranges = (!new.is_empty())
+            .then_some((0, new.len()))
+            .into_iter()
+            .collect();
+        return (old_ranges, new_ranges);
+    }
     let diff = TextDiff::from_words(old, new);
     let mut old_ranges: ByteRanges = Vec::new();
     let mut new_ranges: ByteRanges = Vec::new();
@@ -202,5 +232,20 @@ diff --git a/x.rs b/x.rs
         assert!(lines[1].emphasis.is_empty());
         // The add carries emphasis for its changed word.
         assert!(!lines[2].emphasis.is_empty());
+    }
+
+    #[test]
+    fn oversized_word_diff_uses_whole_line_fallback() {
+        let old = "alpha ".repeat(MAX_WORD_DIFF_BYTES / 3);
+        let new = "beta ".repeat(MAX_WORD_DIFF_BYTES / 3);
+        let (old_ranges, new_ranges) = word_emphasis(&old, &new);
+        assert_eq!(old_ranges, vec![(0, old.len())]);
+        assert_eq!(new_ranges, vec![(0, new.len())]);
+        assert_eq!(word_emphasis(&old, &old), (Vec::new(), Vec::new()));
+
+        let old = "a ".repeat(MAX_WORD_DIFF_TOKENS + 1);
+        let new = "b ".repeat(MAX_WORD_DIFF_TOKENS + 1);
+        assert!(old.len() < MAX_WORD_DIFF_BYTES);
+        assert_eq!(word_emphasis(&old, &new).0, vec![(0, old.len())]);
     }
 }

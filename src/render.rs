@@ -60,10 +60,6 @@ impl Default for RenderOptions {
     }
 }
 
-/// Blank gutter (5 cols) matching the width of a rendered `"{:>4} "` number, so
-/// remove lines and unnumbered rows align with numbered ones.
-const BLANK_GUTTER: &str = "     ";
-
 /// The rendered diff plus the per-file line offsets that let the UI scroll the
 /// main view to a chosen file. `file_starts[i]` is the index in `lines` of the
 /// first rendered line of `model.files[i]` (its header row).
@@ -91,6 +87,7 @@ pub struct RenderedDiff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSummary {
     pub path: String,
+    pub path_bytes: Vec<u8>,
     pub additions: usize,
     pub deletions: usize,
 }
@@ -116,6 +113,7 @@ pub fn file_summaries(model: &DiffModel) -> Vec<FileSummary> {
             }
             FileSummary {
                 path: file.path.clone(),
+                path_bytes: file.path_bytes.clone(),
                 additions,
                 deletions,
             }
@@ -467,6 +465,8 @@ fn stack_rows(
                         );
                         byte_pos += len;
                     }
+                    append_no_newline_marker(&mut spans, dl, theme);
+                    spans = expand_tabs(spans);
                     // Added/removed rows get a full-row background tint: pad to the
                     // row width with spaces, then paint the tint behind every span
                     // that isn't already carrying the stronger emphasis background.
@@ -581,6 +581,7 @@ fn split_rows(
     width: u16,
 ) -> RenderedDiff {
     let col_w = (width.saturating_sub(SEP) / 2).max(1) as usize;
+    let gw = gutter_width(model).max(4);
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
@@ -588,6 +589,7 @@ fn split_rows(
     // Split emits only whole-file (generated) fold bars, not per-hunk context folds.
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
     for (file_idx, file) in model.files.iter().enumerate() {
+        let mut fold_index = 0usize;
         // Same file_starts contract as stack: the header row index per file.
         file_starts.push(out.len());
         push_file_header(&mut out, file, theme);
@@ -619,13 +621,36 @@ fn split_rows(
                 .map(|dl| highlighter.highlight_line(&mut hl, &dl.content))
                 .collect();
 
+            let mut bar_fold: Vec<Option<(FoldId, usize)>> = vec![None; hunk.lines.len()];
+            let mut hidden = vec![false; hunk.lines.len()];
+            if !opts.context_collapsed {
+                for fold in compute_hunk_folds(&hunk.lines, file_idx, &mut fold_index) {
+                    bar_fold[fold.start] = Some((fold.id, fold.hidden()));
+                    if !is_expanded(folds, fold.id) {
+                        hidden[fold.start..fold.end].fill(true);
+                    }
+                }
+            }
+
             let mut i = 0;
             while i < hunk.lines.len() {
                 let dl = &hunk.lines[i];
+                if let Some((id, count)) = bar_fold[i] {
+                    fold_bars.push((out.len(), id));
+                    out.push(fold_bar_line(count, is_expanded(folds, id), theme));
+                }
+                if hidden[i] {
+                    old_line = old_line.map(|line| line + 1);
+                    new_line = new_line.map(|line| line + 1);
+                    i += 1;
+                    continue;
+                }
                 if dl.kind == LineKind::Context {
                     if !opts.context_collapsed {
-                        let left = build_cell(dl, &highlighted[i], old_line, theme, opts, col_w);
-                        let right = build_cell(dl, &highlighted[i], new_line, theme, opts, col_w);
+                        let left =
+                            build_cell(dl, &highlighted[i], old_line, theme, opts, gw, col_w);
+                        let right =
+                            build_cell(dl, &highlighted[i], new_line, theme, opts, gw, col_w);
                         out.push(compose_row(left, right, theme));
                     }
                     old_line = old_line.map(|n| n + 1);
@@ -657,6 +682,7 @@ fn split_rows(
                                 old_line,
                                 theme,
                                 opts,
+                                gw,
                                 col_w,
                             );
                             old_line = old_line.map(|n| n + 1);
@@ -672,6 +698,7 @@ fn split_rows(
                                 new_line,
                                 theme,
                                 opts,
+                                gw,
                                 col_w,
                             );
                             new_line = new_line.map(|n| n + 1);
@@ -711,12 +738,14 @@ fn vertical_rows(
     width: u16,
 ) -> RenderedDiff {
     let full_w = width.max(1) as usize;
+    let gw = gutter_width(model).max(4);
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<usize> = Vec::with_capacity(model.files.len());
     let mut hunk_starts: Vec<usize> = Vec::new();
     let mut fold_bars: Vec<(usize, FoldId)> = Vec::new();
     for (file_idx, file) in model.files.iter().enumerate() {
+        let mut fold_index = 0usize;
         file_starts.push(out.len());
         push_file_header(&mut out, file, theme);
 
@@ -743,21 +772,41 @@ fn vertical_rows(
                 .map(|dl| highlighter.highlight_line(&mut hl, &dl.content))
                 .collect();
 
+            let mut bar_fold: Vec<Option<(FoldId, usize)>> = vec![None; hunk.lines.len()];
+            let mut hidden = vec![false; hunk.lines.len()];
+            if !opts.context_collapsed {
+                for fold in compute_hunk_folds(&hunk.lines, file_idx, &mut fold_index) {
+                    bar_fold[fold.start] = Some((fold.id, fold.hidden()));
+                    if !is_expanded(folds, fold.id) {
+                        hidden[fold.start..fold.end].fill(true);
+                    }
+                }
+            }
+
             // Old block: context + removes, numbered on the old side.
             let mut old_emitted = 0usize;
             for (i, dl) in hunk.lines.iter().enumerate() {
                 if dl.kind == LineKind::Add {
                     continue;
                 }
-                let cell = build_cell(dl, &highlighted[i], old_line, theme, opts, full_w);
-                out.push(Line::from(cell));
+                if let Some((id, count)) = bar_fold[i] {
+                    fold_bars.push((out.len(), id));
+                    out.push(fold_bar_line(count, is_expanded(folds, id), theme));
+                }
+                if !(hidden[i] || opts.context_collapsed && dl.kind == LineKind::Context) {
+                    let cell = build_cell(dl, &highlighted[i], old_line, theme, opts, gw, full_w);
+                    out.push(Line::from(cell));
+                    old_emitted += 1;
+                }
                 old_line = old_line.map(|n| n + 1);
-                old_emitted += 1;
             }
             // Dim rule between the blocks — only when BOTH are non-empty, so a
             // pure-add or pure-delete hunk doesn't leave a rule floating against
             // an empty side.
-            let new_nonempty = hunk.lines.iter().any(|dl| dl.kind != LineKind::Remove);
+            let new_nonempty = hunk.lines.iter().any(|dl| {
+                dl.kind != LineKind::Remove
+                    && !(opts.context_collapsed && dl.kind == LineKind::Context)
+            });
             if old_emitted > 0 && new_nonempty {
                 out.push(Line::from(Span::styled(
                     "─".repeat(full_w),
@@ -771,8 +820,14 @@ fn vertical_rows(
                 if dl.kind == LineKind::Remove {
                     continue;
                 }
-                let cell = build_cell(dl, &highlighted[i], new_line, theme, opts, full_w);
-                out.push(Line::from(cell));
+                if let Some((id, count)) = bar_fold[i] {
+                    fold_bars.push((out.len(), id));
+                    out.push(fold_bar_line(count, is_expanded(folds, id), theme));
+                }
+                if !(hidden[i] || opts.context_collapsed && dl.kind == LineKind::Context) {
+                    let cell = build_cell(dl, &highlighted[i], new_line, theme, opts, gw, full_w);
+                    out.push(Line::from(cell));
+                }
                 new_line = new_line.map(|n| n + 1);
             }
         }
@@ -799,6 +854,7 @@ fn build_cell(
     gutter: Option<usize>,
     theme: &Theme,
     opts: &RenderOptions,
+    gutter_width: usize,
     col_w: usize,
 ) -> Vec<Span<'static>> {
     let (prefix, prefix_style) = prefix_for(dl, theme);
@@ -806,13 +862,14 @@ fn build_cell(
     let mut spans: Vec<Span<'static>> = Vec::new();
     if opts.line_numbers {
         let g = match gutter {
-            Some(n) => format!("{n:>4} "),
-            None => BLANK_GUTTER.to_string(),
+            Some(n) => format!("{n:>gutter_width$} "),
+            None => " ".repeat(gutter_width + 1),
         };
         spans.push(Span::styled(g, Style::default().fg(theme.gutter)));
     }
     spans.push(Span::styled(prefix.to_string(), prefix_style));
     append_content_spans(&mut spans, highlighted, &dl.emphasis, emph_bg);
+    append_no_newline_marker(&mut spans, dl, theme);
     // The cell is already padded to `col_w` by `fit_to_width`, so the tint reaches
     // the column edge once painted behind every not-yet-backgrounded span.
     let mut cell = fit_to_width(spans, col_w);
@@ -844,7 +901,7 @@ fn row_tint(dl: &DiffLine, theme: &Theme) -> (Option<Color>, Option<Color>) {
 /// No-op when already at/over `width`. The pad is plain spaces, matching the
 /// terminal's own blank-cell fill, so it never changes a snapshot's symbols.
 fn pad_to_width(spans: &mut Vec<Span<'static>>, width: usize) {
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = spans.iter().map(Span::width).sum();
     if used < width {
         spans.push(Span::raw(" ".repeat(width - used)));
     }
@@ -901,28 +958,36 @@ fn append_content_spans(
     }
 }
 
+fn append_no_newline_marker(spans: &mut Vec<Span<'static>>, dl: &DiffLine, theme: &Theme) {
+    if dl.no_newline {
+        spans.push(Span::styled(
+            " [no newline at end of file]",
+            Style::default()
+                .fg(theme.gutter)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+}
+
 /// Truncate `spans` to at most `width` columns and right-pad with spaces to
 /// exactly `width`. Width is measured in chars (matching the sidebar's
 /// `truncate_path`); truncation cuts on char boundaries so multibyte content
 /// never panics. The padding span carries no style, so it inherits the
 /// terminal default.
 fn fit_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let spans = expand_tabs(spans);
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
-    for span in spans {
-        if used >= width {
-            break;
+    'spans: for span in spans {
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if used + grapheme_width > width {
+                break 'spans;
+            }
+            push_styled_text(&mut out, grapheme.symbol, grapheme.style);
+            used += grapheme_width;
         }
-        let remaining = width - used;
-        let count = span.content.chars().count();
-        if count <= remaining {
-            used += count;
-            out.push(span);
-        } else {
-            // Cut this span on a char boundary; we have filled the column.
-            let truncated: String = span.content.chars().take(remaining).collect();
-            used = width;
-            out.push(Span::styled(truncated, span.style));
+        if used >= width {
             break;
         }
     }
@@ -930,6 +995,33 @@ fn fit_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
         out.push(Span::raw(" ".repeat(width - used)));
     }
     out
+}
+
+fn expand_tabs(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    const TAB_STOP: usize = 8;
+    let mut out = Vec::with_capacity(spans.len());
+    let mut column = 0usize;
+    for span in spans {
+        for grapheme in span.styled_graphemes(Style::default()) {
+            if grapheme.symbol == "\t" {
+                let spaces = TAB_STOP - (column % TAB_STOP);
+                push_styled_text(&mut out, &" ".repeat(spaces), grapheme.style);
+                column += spaces;
+            } else {
+                push_styled_text(&mut out, grapheme.symbol, grapheme.style);
+                column += Span::raw(grapheme.symbol).width();
+            }
+        }
+    }
+    out
+}
+
+fn push_styled_text(out: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if let Some(last) = out.last_mut().filter(|span| span.style == style) {
+        last.content.to_mut().push_str(text);
+    } else {
+        out.push(Span::styled(text.to_string(), style));
+    }
 }
 
 /// Compose a left cell, the column separator, and a right cell into one line.
@@ -1055,6 +1147,14 @@ fn styled_segment(
 /// Emit a file's header line (and a marker line for binary files). Shared by the
 /// stack and split layouts so the header format has one source of truth.
 fn push_file_header(out: &mut Vec<Line<'static>>, file: &FileDiff, theme: &Theme) {
+    for (i, raw) in file.preamble.iter().enumerate() {
+        let color = if i == 0 {
+            theme.file_header
+        } else {
+            theme.gutter
+        };
+        out.push(Line::styled(raw.clone(), Style::default().fg(color)));
+    }
     out.push(Line::from(Span::styled(
         format!("── {} ", file.path),
         Style::default()
@@ -1100,7 +1200,7 @@ diff --git a/src/main.rs b/src/main.rs
 index e69de29..4b825dc 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1,2 +1,3 @@
+@@ -1,3 +1,4 @@
  fn main() {
 -    println!(\"old\");
 +    println!(\"new\");
@@ -1274,6 +1374,61 @@ diff --git a/x.txt b/x.txt
             "removed line missing"
         );
         assert!(text.iter().any(|l| l.contains("new")), "added line missing");
+    }
+
+    #[test]
+    fn no_newline_marker_renders_without_extra_source_row() {
+        let model = parse_unified_diff(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n",
+        );
+        let highlighter = Highlighter::new();
+        for mode in [LayoutMode::Stack, LayoutMode::Split, LayoutMode::Vertical] {
+            let opts = RenderOptions {
+                mode,
+                ..RenderOptions::default()
+            };
+            let rendered = render_diff(
+                &model,
+                &highlighter,
+                &Theme::default(),
+                &opts,
+                &HashSet::new(),
+                120,
+            );
+            let text = rendered
+                .lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                text.matches("[no newline at end of file]").count(),
+                1,
+                "mode {mode:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_commit_preamble_renders_before_its_file() {
+        let model = parse_unified_diff(
+            "commit one\n\ndiff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\ncommit two\nAuthor: Two\n\ndiff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        let rendered = render_diff(
+            &model,
+            &Highlighter::new(),
+            &Theme::default(),
+            &RenderOptions::default(),
+            &HashSet::new(),
+            80,
+        );
+        let commit_row = rendered
+            .lines
+            .iter()
+            .position(|line| line.to_string() == "commit two")
+            .expect("second commit metadata");
+        assert_eq!(rendered.file_starts[1], commit_row);
+        assert!(rendered.lines[commit_row + 2].to_string().contains("b"));
     }
 
     #[test]
@@ -1756,6 +1911,42 @@ diff --git a/u.txt b/u.txt
     }
 
     #[test]
+    fn split_aligns_wide_tabs_and_five_digit_gutters() {
+        let model = parse_unified_diff(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -10000 +10000 @@\n-\twide \u{754c} e\u{301} \u{1f642}\n+\tnew \u{754c} e\u{301} \u{1f642}\n",
+        );
+        let opts = RenderOptions {
+            mode: LayoutMode::Split,
+            ..RenderOptions::default()
+        };
+        let width = 81;
+        let rendered = render_diff(
+            &model,
+            &Highlighter::new(),
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            width,
+        );
+        let row = rendered
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("wide"))
+            .expect("paired change row");
+        assert_eq!(row.width(), width as usize);
+        assert!(!row.to_string().contains('\t'));
+        assert_eq!(row.to_string().matches("10000").count(), 2);
+    }
+
+    #[test]
+    fn wide_grapheme_at_cell_boundary_is_replaced_by_padding() {
+        let fitted = fit_to_width(vec![Span::raw("aaa\u{754c}")], 4);
+        let line = Line::from(fitted);
+        assert_eq!(line.width(), 4);
+        assert_eq!(line.to_string(), "aaa ");
+    }
+
+    #[test]
     fn renders_split_layout_to_buffer() {
         let model = parse_unified_diff(TWO_FILE);
         let highlighter = Highlighter::new();
@@ -1988,6 +2179,28 @@ index 1111111..2222222 100644
         insta::assert_snapshot!(terminal.backend());
     }
 
+    #[test]
+    fn split_and_vertical_emit_toggleable_context_folds() {
+        let model = parse_unified_diff(FOLD_SAMPLE);
+        let highlighter = Highlighter::new();
+        let theme = Theme::default();
+        for mode in [LayoutMode::Split, LayoutMode::Vertical] {
+            let opts = RenderOptions {
+                mode,
+                ..RenderOptions::default()
+            };
+            let collapsed = render_diff(&model, &highlighter, &theme, &opts, &HashSet::new(), 120);
+            assert!(!collapsed.fold_bars.is_empty(), "mode {mode:?}");
+            assert!(flatten(&collapsed.lines)
+                .iter()
+                .any(|line| line.contains("unchanged lines")));
+
+            let expanded: HashSet<FoldId> = collapsed.fold_bars.iter().map(|(_, id)| *id).collect();
+            let shown = render_diff(&model, &highlighter, &theme, &opts, &expanded, 120);
+            assert!(shown.lines.len() > collapsed.lines.len(), "mode {mode:?}");
+        }
+    }
+
     const GENERATED_SAMPLE: &str = "\
 diff --git a/Cargo.lock b/Cargo.lock
 index 1111111..2222222 100644
@@ -2084,6 +2297,28 @@ index 1111111..2222222 100644
             !text[..sep_pos].iter().any(|l| l.contains("added line")),
             "added line must not be in the old block"
         );
+    }
+
+    #[test]
+    fn vertical_context_collapse_hides_context_on_both_sides() {
+        let model = parse_unified_diff(SAMPLE);
+        let opts = RenderOptions {
+            mode: LayoutMode::Vertical,
+            context_collapsed: true,
+            ..RenderOptions::default()
+        };
+        let rendered = render_diff(
+            &model,
+            &Highlighter::new(),
+            &Theme::default(),
+            &opts,
+            &HashSet::new(),
+            60,
+        );
+        let text = flatten(&rendered.lines);
+        assert!(!text.iter().any(|line| line.contains("fn main")));
+        assert!(text.iter().any(|line| line.contains("old\")")));
+        assert!(text.iter().any(|line| line.contains("new\")")));
     }
 
     #[test]

@@ -22,15 +22,17 @@ pub fn find_matches(lines: &[String], query: &str) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
     }
-    // ASCII case-fold both sides: `to_ascii_lowercase` never changes the char
-    // count, so `start`/`end` stay valid char offsets into the rendered line.
-    // ponytail: ASCII-only case-insensitivity — fine for diffs (overwhelmingly
-    // ASCII identifiers); upgrade to Unicode folding only if a real diff needs
-    // it (and only with offset realignment, since folding can change length).
-    let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
     let mut out = Vec::new();
     for (line_idx, text) in lines.iter().enumerate() {
-        let hay: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let mut hay = Vec::new();
+        let mut original_offsets = Vec::new();
+        for (original, ch) in text.chars().enumerate() {
+            for folded in ch.to_lowercase() {
+                hay.push(folded);
+                original_offsets.push(original);
+            }
+        }
         if needle.len() > hay.len() {
             continue;
         }
@@ -40,8 +42,8 @@ pub fn find_matches(lines: &[String], query: &str) -> Vec<Match> {
             if hay[i..i + needle.len()] == needle[..] {
                 out.push(Match {
                     line: line_idx,
-                    start: i,
-                    end: i + needle.len(),
+                    start: original_offsets[i],
+                    end: original_offsets[i + needle.len() - 1] + 1,
                 });
                 i += needle.len();
             } else {
@@ -194,6 +196,10 @@ mod tests {
         // And the reverse: lowercase haystack, uppercase query.
         let m2 = find_matches(&lines(&["hello world"]), "WORLD");
         assert_eq!(m2.len(), 1);
+
+        let unicode = find_matches(&lines(&["CAF\u{00c9}"]), "caf\u{00e9}");
+        assert_eq!(unicode.len(), 1);
+        assert_eq!((unicode[0].start, unicode[0].end), (0, 4));
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //! crashing.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,8 +43,13 @@ impl ViewState {
     /// Parse view-state from JSON text, falling back to defaults on malformed
     /// input (no panic). Pure, so the missing/malformed behavior is testable
     /// without the filesystem.
-    pub fn from_json(s: &str) -> ViewState {
+    #[cfg(test)]
+    fn from_json(s: &str) -> ViewState {
         serde_json::from_str(s).unwrap_or_default()
+    }
+
+    fn parse_json(s: &str) -> Option<ViewState> {
+        serde_json::from_str(s).ok()
     }
 
     /// Load the persisted state if a `state.json` exists and is readable. Returns
@@ -51,7 +57,7 @@ impl ViewState {
     /// defaults; a malformed file yields `Some(default)` (present but unusable).
     pub fn load() -> Option<ViewState> {
         let text = fs::read_to_string(state_path()?).ok()?;
-        Some(ViewState::from_json(&text))
+        ViewState::parse_json(&text)
     }
 
     /// Write the state to `state.json`, creating the config directory if needed.
@@ -61,11 +67,23 @@ impl ViewState {
         let Some(path) = state_path() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, json)
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state path has no parent directory",
+            ));
+        };
+        fs::create_dir_all(parent)?;
+        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(&json)?;
+        temp.as_file_mut().sync_all()?;
+        temp.persist(path).map_err(|error| error.error)?;
+        Ok(())
     }
 }
 
@@ -102,5 +120,25 @@ mod tests {
             ViewState::from_json("{\"line_numbers\":"),
             ViewState::default()
         );
+        assert!(ViewState::parse_json("not json at all").is_none());
+    }
+
+    #[test]
+    fn save_atomically_replaces_existing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "old").unwrap();
+        let state = ViewState {
+            line_numbers: false,
+            wrap_lines: true,
+            hunk_headers: false,
+            context_collapsed: true,
+        };
+        state.save_to(&path).unwrap();
+        assert_eq!(
+            ViewState::parse_json(&fs::read_to_string(&path).unwrap()),
+            Some(state)
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

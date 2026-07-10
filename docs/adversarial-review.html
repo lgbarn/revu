@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>revu adversarial review</title>
+  <style>
+/* doc-style.css — baseline for hand-written, self-contained HTML deliverables.
+   Read this file and INLINE its contents into a <style> block in every doc,
+   then build the bespoke body on top. The produced .html must carry zero
+   external references (inline CSS, data: images, inline <svg> charts). */
+
+:root {
+  --fg: #1a1a1a;
+  --fg-muted: #57606a;
+  --bg: #ffffff;
+  --bg-soft: #f6f8fa;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --pos: #1a7f37;
+  --neg: #cf222e;
+  --warn: #9a6700;
+  --code-bg: #f6f8fa;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e6edf3;
+    --fg-muted: #9198a1;
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --border: #30363d;
+    --accent: #4493f8;
+    --pos: #3fb950;
+    --neg: #f85149;
+    --warn: #d29922;
+    --code-bg: #161b22;
+  }
+}
+
+* , *::before, *::after { box-sizing: border-box; }
+html { font-size: 100%; -webkit-text-size-adjust: 100%; }
+body {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 1rem;
+  line-height: 1.65;
+  color: var(--fg);
+  background: var(--bg);
+}
+h1, h2, h3, h4 { line-height: 1.25; font-weight: 600; margin: 2rem 0 1rem; }
+h1 { font-size: 2rem; padding-bottom: .3rem; border-bottom: 2px solid var(--border); margin-top: 0; }
+h2 { font-size: 1.5rem; padding-bottom: .25rem; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.25rem; }
+h4 { font-size: 1.05rem; color: var(--fg-muted); }
+p, ul, ol { margin: 0 0 1rem; }
+li { margin: .25rem 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 600; }
+hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+blockquote {
+  margin: 1rem 0;
+  padding: .5rem 1rem;
+  border-left: 4px solid var(--border);
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+}
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: .9em;
+  background: var(--code-bg);
+  padding: .15em .4em;
+  border-radius: 4px;
+}
+pre {
+  background: var(--code-bg);
+  padding: 1rem;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  border: 1px solid var(--border);
+}
+pre code { background: none; padding: 0; }
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: .95rem; }
+th, td { padding: .5rem .75rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { background: var(--bg-soft); font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--bg-soft); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+img { max-width: 100%; height: auto; }
+svg { max-width: 100%; }
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+.stat {
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+}
+.stat .value { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat .label { font-size: .8rem; color: var(--fg-muted); text-transform: uppercase; letter-spacing: .03em; }
+.pos { color: var(--pos); }
+.neg { color: var(--neg); }
+.callout { padding: .75rem 1rem; border-radius: var(--radius); border-left: 4px solid var(--accent); background: var(--bg-soft); margin: 1rem 0; }
+.callout.warn { border-left-color: var(--warn); }
+.sev-block { color: var(--neg); font-weight: 700; }
+.sev-high { color: var(--neg); font-weight: 600; }
+.sev-med { color: var(--warn); font-weight: 600; }
+.muted { color: var(--fg-muted); }
+.nowrap { white-space: nowrap; }
+@media (max-width: 600px) {
+  body { padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.6rem; }
+  h2 { font-size: 1.3rem; }
+  table { font-size: .85rem; }
+}
+@media print {
+  body { max-width: none; color: #000; background: #fff; }
+  a { color: #000; }
+}
+  </style>
+</head>
+<body>
+  <h1>revu adversarial review</h1>
+  <p class="muted">Read-only product review of the tracked Rust application, tests, configuration, packaging, and documented behavior. The untracked <code>AGENTS.md</code> was excluded from product findings. Review date: 2026-07-09.</p>
+
+  <div class="callout">
+    <strong class="pos">Remediation status: SHIP-READY</strong><br>
+    All confirmed findings were remediated on 2026-07-09. The final gate passes 189 tests, formatting, Clippy with warnings denied, and the 141/155 crate budget. <code>cargo deny check</code> and <code>cargo audit</code> pass, and the security, correctness, and quality re-reviews are SHIP-READY. The original review and its pre-remediation verdict are preserved below.
+  </div>
+
+  <div class="callout warn">
+    <strong class="sev-block">Original verdict: BLOCK</strong><br>
+    The happy path is well built and all available automated gates pass, but revu does not yet satisfy its own hostile-input and CLI contracts. A repository-controlled filename can be interpreted as an editor command, a repository-controlled theme value can panic, and several advertised input modes silently misrender or become unnavigable.
+  </div>
+
+  <div class="stat-grid">
+    <div class="stat"><div class="value pos">159</div><div class="label">Tests passed</div></div>
+    <div class="stat"><div class="value">138 / 155</div><div class="label">Crate budget</div></div>
+    <div class="stat"><div class="value neg">2</div><div class="label">Security blockers</div></div>
+    <div class="stat"><div class="value">2 models</div><div class="label">Independent passes</div></div>
+  </div>
+
+  <h2>Executive answer</h2>
+  <p>revu does the basic Git diff, render, search, theme, fold, and clean-quit flows well. It does not consistently do what its README and security policy promise under adversarial filenames, malformed repo config, ordinary unified patches, nested working directories, multi-commit pager input, no-newline diffs, wrapped lines, or very large diffs. Shipping should wait for the two security blockers and the high-severity behavior gaps below.</p>
+
+  <h2>Confirmed blockers and high-severity findings</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Finding</th><th>Evidence and trigger</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="sev-block nowrap">BLOCK</td>
+        <td><strong>Repository filename can become an editor command.</strong> The active diff path is appended directly to <code>$VISUAL</code>/<code>$EDITOR</code> without an option terminator. With the default Vim-compatible editor, a root filename such as <code>+!touch PWN</code> is an Ex command, not a file. Pressing <code>e</code> executes it.</td>
+        <td><code>src/app.rs:986-997</code>. This directly contradicts <code>SECURITY.md:36-39</code>, which says user paths are separated with <code>--</code>.</td>
+      </tr>
+      <tr>
+        <td class="sev-block nowrap">BLOCK</td>
+        <td><strong>Untrusted repo-local theme can panic.</strong> <code>parse_hex</code> accepts any six-byte body, then byte-slices at <code>0..2</code>, <code>2..4</code>, and <code>4..6</code>. A valid TOML value such as two three-byte Unicode characters passes the length check and panics at a non-character boundary.</td>
+        <td><code>src/theme.rs:502-516</code>; repo config is loaded from <code>src/config.rs:135-138,231-237</code>. This violates the untrusted-config threat model in <code>SECURITY.md:40-42</code>.</td>
+      </tr>
+      <tr>
+        <td class="sev-high nowrap">HIGH</td>
+        <td><strong>Saved state defeats explicit CLI flags.</strong> CLI overrides are applied during config resolution, then <code>state.json</code> overwrites line numbers, wrapping, and hunk headers. <code>--no-line-numbers</code> can therefore show line numbers, despite the help and README saying the CLI wins.</td>
+        <td><code>src/config.rs:160-179</code> then <code>src/app.rs:246-281</code>; contract at <code>README.md:127-139,159-162</code>.</td>
+      </tr>
+      <tr>
+        <td class="sev-high nowrap">HIGH</td>
+        <td><strong>Nested-directory operation uses incompatible path bases.</strong> Git diff paths are repository-root-relative, but editor and blame subprocesses run from the caller's current directory. Blame silently disappears and <code>e</code> opens the wrong file. Untracked discovery from a subdirectory is scoped differently and omits untracked files elsewhere in the repo.</td>
+        <td><code>src/vcs/git.rs:40-47,72-110,165-210</code>; <code>src/app.rs:986-997,1291-1305</code>. A direct Git fixture confirmed <code>git diff</code> emitted <code>sub/file</code> while blame from <code>sub/</code> interpreted it as <code>sub/sub/file</code>.</td>
+      </tr>
+      <tr>
+        <td class="sev-high nowrap">HIGH</td>
+        <td><strong>Ordinary unified patches render as no changes.</strong> The parser creates a file only after <code>diff --git</code>. A standard <code>diff -u</code> patch beginning with <code>---</code>/<code>+++</code>/<code>@@</code> creates a hunk but no file, so the hunk is discarded.</td>
+        <td><code>src/diff.rs:85-157,219-222</code>; advertised patch support at <code>README.md:35-37,94-95</code>. Claude independently flagged the orphan-hunk drop.</td>
+      </tr>
+      <tr>
+        <td class="sev-high nowrap">HIGH</td>
+        <td><strong><code>git log -p</code> corrupts multi-commit input.</strong> After the first hunk, later commit headers are classified as context lines until the next <code>diff --git</code>, corrupting content and line numbers. The README explicitly advertises this pager flow.</td>
+        <td><code>src/diff.rs:92-145</code>; contract at <code>README.md:98-103</code>.</td>
+      </tr>
+      <tr>
+        <td class="sev-high nowrap">HIGH</td>
+        <td><strong>Wrapped content cannot be navigated reliably.</strong> Ratatui scrolls wrapped visual rows, while revu calculates bounds, active file, selection, and navigation from unwrapped logical line counts. One long wrapped line can extend below the viewport while <code>max_offset</code> remains zero.</td>
+        <td><code>src/app.rs:547-593,1138-1145</code>. This breaks the advertised <code>--wrap</code> mode.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Medium-severity correctness and UX findings</h2>
+  <table>
+    <thead><tr><th>Finding</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><strong>No-newline markers are treated as real context.</strong> <code>\ No newline at end of file</code> advances both counters, breaks remove/add pairing, and appears on both sides in split/vertical modes.</td><td><code>src/diff.rs:124-141</code>; counter behavior at <code>src/render.rs:247-279,487-496,622-683</code>.</td></tr>
+      <tr><td><strong>Diffs beyond 65,535 rendered lines are unreachable.</strong> The line total and all vertical offsets saturate to <code>u16</code>, so the rest of the model can never be scrolled to or searched into view.</td><td><code>src/app.rs:547-552,1184-1247</code>.</td></tr>
+      <tr><td><strong>Pure renames with spaces still display the wrong path.</strong> Git emits unquoted <code>diff --git a/a b b/c d</code> with no <code>---</code>/<code>+++</code> lines; the fallback takes only the last whitespace token. This contradicts the 0.3.0 path fix.</td><td><code>src/diff.rs:225-247</code>; <code>CHANGELOG.md:27-31</code>. A real Git fixture produced this exact header.</td></tr>
+      <tr><td><strong>Stash metadata is not rendered.</strong> <code>git stash show -p</code> begins directly with the diff, so the model preamble is empty even though README and changelog promise hash, author, date, and message.</td><td><code>src/vcs/git.rs:145-162</code>; claims at <code>README.md:35-37</code> and <code>CHANGELOG.md:20-25</code>. Confirmed with a real stash fixture.</td></tr>
+      <tr><td><strong>Display width math is not terminal width math.</strong> Split sizing, truncation, padding, and sidebar alignment use character count. Wide glyphs misalign columns and tabs have zero terminal width, effectively disappearing from code.</td><td><code>src/render.rs:843-851,904-933</code>; <code>src/app.rs:1505-1545</code>. Both models independently flagged this.</td></tr>
+      <tr><td><strong>Vertical mode ignores context collapse.</strong> Pressing <code>c</code> sets the option, but vertical rendering emits every context line. Context folds also exist only in stack mode.</td><td><code>src/app.rs:880-883</code>; <code>src/render.rs:705-789</code>.</td></tr>
+      <tr><td><strong>User Git colors can falsify moved-line detection.</strong> Any SGR parameter equal to 33-36 or 93-96 marks a line as moved. A custom normal add/remove color, including an RGB channel with one of those values, can mark ordinary edits as moves.</td><td><code>src/diff.rs:160-217</code>; Git palette is not normalized at <code>src/vcs/git.rs:72-96</code>.</td></tr>
+      <tr><td><strong>Absolute no-index paths lose the leading slash.</strong> Git represents absolute inputs under <code>a/</code> and <code>b/</code>; stripping those prefixes yields a relative display/editor path. The difftool's authoritative repo path argument is accepted but unused.</td><td><code>src/diff.rs:269-275</code>; <code>src/app.rs:168-187</code>.</td></tr>
+      <tr><td><strong>Live refresh errors are invisible and interval zero is accepted.</strong> Repo config can force a blocking Git fetch every event-loop cycle, while all live errors are swallowed without a status message.</td><td><code>src/config.rs:100-113,209-214</code>; <code>src/app.rs:496-625</code>. Both models flagged the missing lower bound.</td></tr>
+      <tr><td><strong>Theme behavior drifts from config.</strong> The light/dark auto mode defaults to dark unless <code>COLORFGBG</code> is set; selecting a live theme discards transparent-background behavior; and a configured <code>custom_theme.base</code> can override a CLI <code>--theme</code>.</td><td><code>src/theme.rs:416-454,519-539</code>; <code>src/app.rs:714-719</code>.</td></tr>
+      <tr><td><strong>Terminal restoration is incomplete.</strong> SIGTERM/SIGHUP bypass cleanup, and a panic restores Ratatui state but leaves mouse capture enabled. This is acknowledged in source but conflicts with the good-terminal-citizen claim.</td><td><code>src/app.rs:291-335</code>; <code>README.md:54-55</code>. Both models independently agreed.</td></tr>
+      <tr><td><strong>Release automation trusts mutable third-party action tags.</strong> The upload action receives a repository write token while referenced only by <code>@v1</code>; other actions are also tag-pinned rather than commit-pinned. The tag workflow does not verify the Git tag equals <code>Cargo.toml</code>'s version.</td><td><code>.github/workflows/release.yml:3-9,50-69</code>; version is <code>Cargo.toml:3</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Cross-model result</h2>
+  <h3>Both independent passes found</h3>
+  <ul>
+    <li>SIGTERM/SIGHUP and panic mouse-capture restoration gaps.</li>
+    <li>Incorrect character-count display width for wide glyphs and tabs.</li>
+    <li>No lower bound for <code>live_interval_ms</code>.</li>
+    <li>The focused network-crate denylist is not a proof that future code remains offline.</li>
+    <li>Documentation drift around live refresh and the stale <code>0.1.x</code> security policy.</li>
+    <li>Non-Git orphan hunks are discarded and state writes are non-atomic.</li>
+  </ul>
+
+  <h3>Codex-only findings from the independent stage</h3>
+  <p>The editor option injection, Unicode theme panic, CLI/state precedence inversion, nested-directory path-base mismatch, multi-commit pager corruption, wrapped-scroll bounds, no-newline marker corruption, 65,535-line ceiling, pure-rename path regression, and missing stash metadata were not found by Claude. These are source-confirmed and drive the final BLOCK verdict.</p>
+
+  <h3>Claude-only findings from the independent stage</h3>
+  <ul>
+    <li><code>gh pr diff</code> is strict UTF-8 while local Git paths use lossy decoding: <code>src/app.rs:121-133</code>.</li>
+    <li>Pager mode has no stdout-TTY guard, so redirection can write terminal control output to a file: <code>src/pager.rs:23-38</code>.</li>
+    <li>The latent blame ref argument lacks <code>--end-of-options</code>: <code>src/vcs/git.rs:165-176</code>. Current app callers pass no ref, so it is not presently reachable.</li>
+    <li>Word-diff runtime is unbounded for pathological lines: <code>src/worddiff.rs:86-111</code>.</li>
+  </ul>
+
+  <h3>Model disagreement</h3>
+  <p>Claude's independent verdict was conditional SHIP and stated that no high-severity issues or hostile-input panics were reachable. The fixed byte slicing in <code>parse_hex</code>, editor argv construction, and the documented parser/path contracts disprove that conclusion. The final cross-referenced verdict is therefore BLOCK.</p>
+
+  <h2>Attack vectors to retain as regression tests</h2>
+  <ol>
+    <li>Clone a repo with a root file named like a Vim <code>+</code> command, review it, and press <code>e</code>. Verify only the file opens and no command runs.</li>
+    <li>Place a six-byte non-ASCII hex body in <code>.revu/config.toml</code>. Verify a clean validation error, never a panic.</li>
+    <li>Set saved state opposite to each explicit display flag. Verify the explicit CLI value wins.</li>
+    <li>Run from a nested subdirectory with changed and untracked files inside and outside it. Verify diff inclusion, blame, reload, and editor paths.</li>
+    <li>Feed standard <code>diff -u</code>, multi-commit <code>git log -p</code>, no-newline markers, a pure rename with spaces, an absolute two-file diff, and a stash. Assert the parsed model and rendered metadata.</li>
+    <li>Render a single line that wraps to more rows than the viewport and a model above 65,535 rows. Verify every visual row remains reachable.</li>
+    <li>Render tabs, combining marks, CJK, and emoji in split mode. Assert separator columns by terminal display width.</li>
+    <li>Send SIGTERM and induce a controlled panic after mouse capture. Verify cooked mode, normal screen, visible cursor, and mouse capture disabled.</li>
+  </ol>
+
+  <h2>Verification evidence</h2>
+  <table>
+    <thead><tr><th>Gate</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>cargo fmt --all --check</code></td><td class="pos">Pass</td></tr>
+      <tr><td><code>cargo clippy --all-targets -- -D warnings</code></td><td class="pos">Pass</td></tr>
+      <tr><td><code>cargo test --all-targets</code></td><td class="pos">Pass: 159 total tests, 0 failed</td></tr>
+      <tr><td>Supply-chain unit guard</td><td class="pos">Pass: no forbidden crate from the focused list</td></tr>
+      <tr><td>Transitive crate budget</td><td class="pos">Pass: 138, budget 155</td></tr>
+      <tr><td><code>RUSTDOCFLAGS="-D warnings" cargo doc --no-deps</code></td><td class="pos">Pass</td></tr>
+      <tr><td><code>cargo deny check</code></td><td>Not run: <code>cargo-deny</code> is not installed locally</td></tr>
+      <tr><td><code>cargo audit</code></td><td>Not run: <code>cargo-audit</code> is not installed locally</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Documentation and packaging drift</h2>
+  <ul>
+    <li><code>README.md:109-110</code> calls its options list complete, but omits <code>--live</code>, <code>--no-live</code>, the <code>L</code> key, <code>live</code>, and <code>live_interval_ms</code>.</li>
+    <li><code>SECURITY.md:5-12</code> says only latest <code>0.1.x</code> is supported while the package is <code>0.3.1</code>.</li>
+    <li><code>CHANGELOG.md:111-117</code> has no links for 0.3.0/0.3.1 and still compares Unreleased from 0.1.5.</li>
+    <li><code>packaging/homebrew/revu.rb:19</code> remains a 0.1.0 template; release rewriting makes this functional, but the release lacks a version-consistency gate.</li>
+    <li>The supply-chain test at <code>tests/supply_chain.rs:15-34</code> is a focused name denylist. New network code can use <code>std::net</code> or an unlisted crate without failing it, so it is a useful tripwire rather than enforcement of the absolute offline claim.</li>
+  </ul>
+
+  <h2>Exit criteria</h2>
+  <p>Move from BLOCK to HOLD after closing both security blockers and adding regression tests. Move from HOLD to SHIP after fixing CLI precedence, generic patch parsing, nested-directory paths, multi-commit pager parsing, wrapped/large navigation, and no-newline markers; then rerun all CI gates plus the unavailable audit tools and the manual terminal checklist.</p>
+</body>
+</html>

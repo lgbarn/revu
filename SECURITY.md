@@ -3,12 +3,12 @@
 ## Supported versions
 
 revu is pre-1.0 and ships from a single line of development. Security fixes land
-on the latest released `0.1.x` version; please upgrade to the most recent
+on the latest release; please upgrade to the most recent
 release before reporting.
 
 | Version | Supported |
 | ------- | --------- |
-| latest `0.1.x` | yes |
+| latest release | yes |
 | older releases | no — upgrade first |
 
 ## Reporting a vulnerability
@@ -26,8 +26,10 @@ window to investigate and ship a fix before any public disclosure.
 
 ## Scope and threat model
 
-revu is a local command-line tool. It makes **zero network calls** and collects
-**no telemetry**, so there is no remote attack surface from the binary itself.
+revu is a local command-line tool. Its Rust code contains no network client and
+collects **no telemetry**. The optional `--pr` flow delegates fetching to the
+user-installed `gh` CLI, which may use the network under the user's existing
+authentication.
 The security-relevant surfaces are:
 
 - **Parsing untrusted diff/patch input** (`revu patch`, piped `pager` input, two

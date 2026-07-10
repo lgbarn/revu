@@ -2,6 +2,7 @@
 //! subprocesses (always via argument vectors, never a shell string) to produce
 //! the diff text that the rest of revu parses and renders.
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -19,6 +20,49 @@ pub struct GitAdapter {
     cwd: Option<PathBuf>,
 }
 
+fn add_stable_diff_colors(args: &mut Vec<String>) {
+    for setting in [
+        "color.diff.old=red",
+        "color.diff.new=green",
+        "color.diff.oldMoved=magenta",
+        "color.diff.newMoved=cyan",
+        "color.diff.oldMovedAlternative=yellow",
+        "color.diff.newMovedAlternative=blue",
+    ] {
+        args.extend(["-c".to_string(), setting.to_string()]);
+    }
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+fn pathbuf_from_git_line(mut bytes: Vec<u8>) -> Result<PathBuf> {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(
+            String::from_utf8(bytes).context("git printed non-UTF-8 path")?,
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    "NUL"
+}
+
 impl GitAdapter {
     pub fn new() -> Self {
         Self {
@@ -27,14 +71,19 @@ impl GitAdapter {
         }
     }
 
-    /// Like [`GitAdapter::new`], but runs git inside `dir` rather than the
-    /// process working directory. Primarily for testing against fixture repos.
-    #[cfg(test)]
-    pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
+    /// Run git from an explicit directory. Repository-rooted callers use this
+    /// to keep model paths, blame paths, and synthesized untracked diffs in the
+    /// same root-relative namespace.
+    pub(crate) fn at(dir: impl Into<PathBuf>) -> Self {
         Self {
             program: "git".to_string(),
             cwd: Some(dir.into()),
         }
+    }
+
+    #[cfg(test)]
+    fn in_dir(dir: impl Into<PathBuf>) -> Self {
+        Self::at(dir)
     }
 
     fn run(&self, args: &[&str]) -> Result<Output> {
@@ -62,11 +111,7 @@ impl VcsAdapter for GitAdapter {
                 "not a git repository (run revu inside a git working tree)"
             ));
         }
-        let root = String::from_utf8(out.stdout)
-            .context("git printed non-UTF-8 path")?
-            .trim()
-            .to_string();
-        Ok(PathBuf::from(root))
+        pathbuf_from_git_line(out.stdout)
     }
 
     fn diff(&self, opts: &DiffOptions) -> Result<String> {
@@ -78,13 +123,18 @@ impl VcsAdapter for GitAdapter {
         let mut args: Vec<String> = vec![
             "-c".into(),
             "color.ui=always".into(),
+            "-c".into(),
+            "core.quotepath=true".into(),
+        ];
+        add_stable_diff_colors(&mut args);
+        args.extend([
             "diff".into(),
             "--color-moved=zebra".into(),
             // Load the WHOLE file as context (not git's default 3 lines) so the
             // model holds every line; the renderer folds long unchanged runs into
             // collapsible bars, keeping the visible render small (see src/fold.rs).
             "--unified=100000".into(),
-        ];
+        ]);
         if opts.staged {
             args.push("--staged".into());
         }
@@ -103,15 +153,22 @@ impl VcsAdapter for GitAdapter {
         // Untracked files never appear in `git diff`; synthesize a diff for each
         // by comparing against /dev/null. Staged-only reviews skip this.
         if opts.include_untracked && !opts.staged {
-            for path in self.untracked_files(&opts.paths)? {
-                text.push_str(&self.no_index_diff("/dev/null", &path)?);
+            let root = self.repo_root()?;
+            let rooted = GitAdapter::at(&root);
+            let untracked = if opts.paths.is_empty() {
+                rooted.untracked_files(&opts.paths)?
+            } else {
+                self.untracked_files(&opts.paths)?
+            };
+            for path in untracked {
+                text.push_str(&rooted.no_index_diff(OsStr::new(null_device()), &path)?);
             }
         }
         Ok(text)
     }
 
     fn diff_files(&self, left: &str, right: &str) -> Result<String> {
-        self.no_index_diff(left, right)
+        self.no_index_diff(OsStr::new(left), OsStr::new(right))
     }
 
     fn revision_show(&self, reff: &str) -> Result<String> {
@@ -125,16 +182,22 @@ impl VcsAdapter for GitAdapter {
         // `--end-of-options` stops a ref that begins with `-` from being parsed
         // as a flag, while still treating it as a revision (unlike `--`, which
         // would force pathspec interpretation).
-        let out = self.run(&[
-            "-c",
-            "color.ui=always",
-            "show",
-            "--color-moved=zebra",
+        let mut args = vec![
+            "-c".to_string(),
+            "color.ui=always".to_string(),
+            "-c".to_string(),
+            "core.quotepath=true".to_string(),
+        ];
+        add_stable_diff_colors(&mut args);
+        args.extend([
+            "show".to_string(),
+            "--color-moved=zebra".to_string(),
             // Full-file context (see `diff`): fold long unchanged runs at render.
-            "--unified=100000",
-            "--end-of-options",
-            reff,
-        ])?;
+            "--unified=100000".to_string(),
+        ]);
+        args.extend(["--end-of-options".to_string(), reff.to_string()]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git show failed: {}", stderr.trim()));
@@ -143,38 +206,73 @@ impl VcsAdapter for GitAdapter {
     }
 
     fn stash_show(&self, reff: &str) -> Result<String> {
-        let out = self.run(&[
-            "-c",
-            "color.ui=always",
-            "stash",
-            "show",
-            "-p",
-            "--color-moved=zebra",
+        let metadata = self.run(&["show", "-s", "--format=fuller", "--end-of-options", reff])?;
+        if !metadata.status.success() {
+            let stderr = String::from_utf8_lossy(&metadata.stderr);
+            return Err(anyhow!("git stash show failed: {}", stderr.trim()));
+        }
+
+        let mut args = vec![
+            "-c".to_string(),
+            "color.ui=always".to_string(),
+            "-c".to_string(),
+            "core.quotepath=true".to_string(),
+        ];
+        add_stable_diff_colors(&mut args);
+        args.extend([
+            "stash".to_string(),
+            "show".to_string(),
+            "-p".to_string(),
+            "--color-moved=zebra".to_string(),
             // Full-file context (see `diff`): fold long unchanged runs at render.
-            "--unified=100000",
-            "--end-of-options",
-            reff,
-        ])?;
+            "--unified=100000".to_string(),
+        ]);
+        args.extend(["--end-of-options".to_string(), reff.to_string()]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&refs)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git stash show failed: {}", stderr.trim()));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut text = String::from_utf8_lossy(&metadata.stdout).into_owned();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+        text.push_str(&String::from_utf8_lossy(&out.stdout));
+        Ok(text)
     }
 
-    fn blame(&self, reff: Option<&str>, path: &str) -> Result<String> {
+    fn blame(&self, reff: Option<&str>, path: &std::path::Path) -> Result<String> {
         // `--porcelain` is the stable, parse-friendly format; the caller feeds
         // it to `blame::parse_blame`. `<reff>` (when given) blames the file at
         // that revision so the line numbers match the diff's new side; without
         // it, the working-tree file is blamed. `--` separates the pathspec so a
         // path beginning with `-` is never read as a flag.
-        let mut args: Vec<&str> = vec!["blame", "--porcelain"];
+        let resolved_ref;
+        let mut command = Command::new(&self.program);
         if let Some(r) = reff {
-            args.push(r);
+            let verify = format!("{r}^{{commit}}");
+            let out = self.run(&["rev-parse", "--verify", "--end-of-options", &verify])?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow!("invalid blame revision {r:?}: {}", stderr.trim()));
+            }
+            resolved_ref = String::from_utf8(out.stdout)
+                .context("git printed a non-UTF-8 object id")?
+                .trim()
+                .to_string();
+            command.args(["blame", "--porcelain", &resolved_ref, "--"]);
+        } else {
+            command.args(["blame", "--porcelain", "--"]);
         }
-        args.push("--");
-        args.push(path);
-        let out = self.run(&args)?;
+        command.arg(path);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        let out = command
+            .output()
+            .with_context(|| format!("failed to execute `{}` (is git installed?)", self.program))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git blame failed: {}", stderr.trim()));
@@ -186,11 +284,12 @@ impl VcsAdapter for GitAdapter {
 impl GitAdapter {
     /// List untracked, non-ignored files, optionally scoped by `paths`. Uses
     /// `-z` (NUL-separated) so paths with spaces/newlines survive intact.
-    fn untracked_files(&self, paths: &[String]) -> Result<Vec<String>> {
+    fn untracked_files(&self, paths: &[String]) -> Result<Vec<OsString>> {
         let mut args: Vec<String> = vec![
             "ls-files".into(),
             "--others".into(),
             "--exclude-standard".into(),
+            "--full-name".into(),
             "-z".into(),
         ];
         if !paths.is_empty() {
@@ -203,28 +302,50 @@ impl GitAdapter {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git ls-files failed: {}", stderr.trim()));
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect())
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            Ok(out
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| OsString::from_vec(path.to_vec()))
+                .collect())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(OsString::from)
+                .collect())
+        }
     }
 
     /// Diff two paths with `--no-index`. git exits 1 (not 0) when the files
     /// differ, which is the normal, expected case here, so only a status > 1 or
     /// a spawn failure is treated as an error.
-    fn no_index_diff(&self, left: &str, right: &str) -> Result<String> {
-        let out = self.run(&[
-            "-c",
-            "color.ui=never",
-            "diff",
-            "--no-index",
-            // Full-file context (see `diff`): fold long unchanged runs at render.
-            "--unified=100000",
-            "--",
-            left,
-            right,
-        ])?;
+    fn no_index_diff(&self, left: &OsStr, right: &OsStr) -> Result<String> {
+        let mut command = Command::new(&self.program);
+        command
+            .args([
+                "-c",
+                "color.ui=never",
+                "-c",
+                "core.quotepath=true",
+                "diff",
+                "--no-index",
+                "--unified=100000",
+                "--",
+            ])
+            .arg(left)
+            .arg(right);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        let out = command
+            .output()
+            .with_context(|| format!("failed to execute `{}` (is git installed?)", self.program))?;
         let code = out.status.code();
         if !out.status.success() && code != Some(1) {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -280,6 +401,20 @@ mod tests {
         fs::write(p.join("untracked.txt"), "UNTRACKED_LINE\n").unwrap();
 
         dir
+    }
+
+    #[test]
+    fn repo_root_line_preserves_spaces_and_native_bytes() {
+        assert_eq!(
+            pathbuf_from_git_line(b" /tmp/repo with spaces \n".to_vec()).unwrap(),
+            PathBuf::from(" /tmp/repo with spaces ")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = pathbuf_from_git_line(b"/tmp/repo-\xff\n".to_vec()).unwrap();
+            assert_eq!(path.as_os_str().as_bytes(), b"/tmp/repo-\xff");
+        }
     }
 
     #[test]
@@ -380,6 +515,43 @@ mod tests {
     }
 
     #[test]
+    fn diff_from_nested_dir_includes_root_relative_untracked_files() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("root.txt"), "root\n").unwrap();
+        fs::write(root.join("sub/in.txt"), "in\n").unwrap();
+        fs::write(root.join("other/out.txt"), "out\n").unwrap();
+
+        let adapter = GitAdapter::in_dir(root.join("sub"));
+        let out = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: Vec::new(),
+                include_untracked: true,
+            })
+            .unwrap();
+        for path in ["root.txt", "sub/in.txt", "other/out.txt"] {
+            assert!(out.contains(path), "missing {path}: {out}");
+        }
+
+        let scoped = adapter
+            .diff(&DiffOptions {
+                staged: false,
+                paths: vec!["in.txt".to_string()],
+                include_untracked: true,
+            })
+            .unwrap();
+        assert!(
+            scoped.contains("sub/in.txt"),
+            "wrong scoped identity: {scoped}"
+        );
+        assert!(!scoped.contains("root.txt"));
+    }
+
+    #[test]
     fn diff_colored_marks_moved_block_via_real_git() {
         use crate::diff::parse_unified_diff_colored;
 
@@ -430,6 +602,37 @@ mod tests {
             moved_count > 0,
             "expected git --color-moved to flag a moved line; diff was:\n{text}"
         );
+    }
+
+    #[test]
+    fn custom_normal_git_color_does_not_mark_ordinary_add_as_moved() {
+        use crate::diff::parse_unified_diff_colored;
+
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "color.diff.new", "cyan"]);
+        fs::write(root.join("f.txt"), "base\n").unwrap();
+        git(root, &["add", "f.txt"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        fs::write(root.join("f.txt"), "base\nordinary\n").unwrap();
+
+        let text = GitAdapter::in_dir(root)
+            .diff(&DiffOptions {
+                staged: false,
+                paths: Vec::new(),
+                include_untracked: false,
+            })
+            .unwrap();
+        let model = parse_unified_diff_colored(&text);
+        let added = model.files[0].hunks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == crate::diff::LineKind::Add)
+            .expect("added line");
+        assert!(!added.moved, "ordinary add inherited user's cyan color");
     }
 
     #[test]
@@ -505,6 +708,14 @@ mod tests {
             out.contains("STASHED_LINE"),
             "missing stashed change: {out}"
         );
+        assert!(
+            out.starts_with("commit "),
+            "missing stash commit metadata: {out}"
+        );
+        assert!(
+            out.contains("AuthorDate:"),
+            "missing stash author date: {out}"
+        );
     }
 
     #[test]
@@ -512,7 +723,7 @@ mod tests {
         let dir = fixture_repo();
         let adapter = GitAdapter::in_dir(dir.path());
         // committed.txt: line 1 committed by "Test", line 2 is an unstaged edit.
-        let porcelain = adapter.blame(None, "committed.txt").unwrap();
+        let porcelain = adapter.blame(None, Path::new("committed.txt")).unwrap();
         assert!(
             porcelain.contains("author Test"),
             "committed line attributed to its author: {porcelain}"
@@ -525,5 +736,12 @@ mod tests {
         let parsed = crate::blame::parse_blame(&porcelain);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].author, "Test");
+
+        assert!(
+            adapter
+                .blame(Some("-w"), Path::new("committed.txt"))
+                .is_err(),
+            "a ref beginning with '-' must not become a blame option"
+        );
     }
 }
